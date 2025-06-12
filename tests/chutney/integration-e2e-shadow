@@ -42,6 +42,7 @@ def gen_shadow_config(seed: int, chutney_bin: Optional[str]) -> dict[str, Any]:
         # re-export PATH. The test scripts assume that
         # usual shell utilities are on it.
         "PATH": os.getenv("PATH"),
+        "NETWORK_ARTI_CI_ARTI_EXTRA_BIN": os.getenv("NETWORK_ARTI_CI_ARTI_EXTRA_BIN", "")
     }
     if chutney_bin is not None:
         env["CHUTNEY_BIN"] = chutney_bin

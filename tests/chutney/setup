@@ -101,4 +101,13 @@ echo "export CHUTNEY_ARTI=\"$CHUTNEY_ARTI\"" >> tests/chutney/arti.run
 "${CHUTNEY_BIN}" configure "$target"
 "${CHUTNEY_BIN}" start "$target"
 CHUTNEY_START_TIME=300 "${CHUTNEY_BIN}" wait_for_bootstrap "$target"
+
+# Tell "chutney verify" to test connection to hidden services with every client
+export CHUTNEY_HS_MULTI_CLIENT=1
+
+# Larger transfers (such as the chutney default of 5 MiB) currently fail for
+# arti hidden service clients.
+# <https://gitlab.torproject.org/tpo/core/arti/-/issues/2109>
+export CHUTNEY_DATA_BYTES=10000
+
 "${CHUTNEY_BIN}" verify "$target"
