@@ -30,7 +30,7 @@ use crate::{Error, Result};
 // returning an error isn't very useful and is maybe unexpected.
 #[derive(Debug)]
 #[pin_project]
-pub struct StreamReceiver {
+pub(crate) struct StreamReceiver {
     /// The underlying `StreamTarget` for this stream.
     ///
     /// A reader has this target in order to:
