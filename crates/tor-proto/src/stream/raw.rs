@@ -94,7 +94,7 @@ impl StreamReceiver {
     }
 
     /// Shut down this stream.
-    pub fn protocol_error(&mut self) {
+    pub(crate) fn protocol_error(&mut self) {
         self.target.protocol_error();
     }
 }
