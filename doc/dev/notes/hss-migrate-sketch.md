@@ -69,5 +69,5 @@ to gather feedback and insights.
 This note is part of the 2025 GSoC proposal "Onion Service Support Tooling for
 Arti" ([link](https://gitlab.torproject.org/tpo/team/-/wikis/GSoC#2-project-onion-service-support-tooling-for-arti)).
 
-Related [milestone],
+Related [milestone](https://gitlab.torproject.org/tpo/core/arti/-/milestones/22#tab-issues),
 Related [issue](https://gitlab.torproject.org/tpo/core/arti/-/issues/2072).
