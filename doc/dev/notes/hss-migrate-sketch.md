@@ -45,10 +45,13 @@ If a TOCTOU race occurs, meaning one of the C Tor keys we’re migrating disappe
 another process writes one of the corresponding keys in the Arti keystore (and our
 preliminary check has passed), the migration will be aborted.
 
-The default behavior may be to remove the CTor keystore once the migration is complete,
-in order to avoid key duplication. Alternatively, it could leave the CTor keystore
-intact to facilitate a backward migration. The previous considerations regarding
-flags/prompts apply here as well.
+`ctor-migrate` will be idempotent, meaning that if it’s run multiple times with the
+same configuration after the migration is complete, the migration won’t be performed
+again, and a message such as "already migrated" will be displayed.
+
+The default behavior will be to leave the original CTor keystore intact, this will
+also facilitate an eventual backward migration. This behavior could be changed
+unsing a flag.
 
 The keys in the CTor keystore are expected to be valid. Therefore, the command will
 produce an error and will not proceed with the action if an invalid key is
