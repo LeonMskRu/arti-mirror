@@ -22,10 +22,6 @@ Where `CTOR_KEYSTORE_ID` is the keystore ID of the C Tor keystore to migrate, as
 configured in the `<ARTI_CONFIG>`, under the `[storage.keystore.ctor.services.<HS_NICK>]`
 section.
 
-A possible variation could involve using a `PATH_TO_CTOR` instead of a `CTOR_KEYSTORE_ID`,
-allowing the operator to perform the migration without needing to alter the configuration
-file specifically for this operation.
-
 `<TARGET_KEYSTORE_ID>` could represent either a configured or a non-configured keystore.
 If the keystore doesn't exist, a new one could be created. In that case, the output would
 provide instructions on how to include it in the configuration file, such as: `Add this
