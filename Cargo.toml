@@ -211,3 +211,5 @@ result_large_err = { level = "allow" }
 needless_raw_string_hashes = { level = "allow" }
 # See arti#1765
 needless_lifetimes = { level = "allow" }
+# temporary workaround for arti#2060
+mismatched_lifetime_syntaxes = { level = "allow" }
