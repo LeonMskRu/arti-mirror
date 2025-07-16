@@ -13,7 +13,10 @@ vice versa).
 
 The command will be:
 ```bash
-arti hss ctor-migrate --config <ARTI_CONFIG> --nickname <HS_NICK> --from <CTOR_KEYSTORE_ID> [--to <TARGET_KEYSTORE_ID>]
+arti hss ctor-migrate --config <ARTI_CONFIG> \
+    --nickname <HS_NICK> \
+    --from <CTOR_KEYSTORE_ID> \
+    [--to <TARGET_KEYSTORE_ID>]
 ```
 Where `CTOR_KEYSTORE_ID` is the keystore ID of the C Tor keystore to migrate, as
 configured in the `<ARTI_CONFIG>`, under the `[storage.keystore.ctor.services.<HS_NICK>]`
