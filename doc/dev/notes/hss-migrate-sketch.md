@@ -65,9 +65,8 @@ level a single call will be sufficient to obtain the result. This will abstract 
 migrate logic as much as possible from `arti::subcommands::hss`.
 The method will have signature:
 ```rust
-fn migrate(&self, to: KeystoreId, from: KeystoreId) -> tor_keymgr::Result<Information>
+fn migrate(&self, to: KeystoreId, from: KeystoreId) -> tor_keymgr::Result<()>
 ```
-where `Information` is a placeholder for something that could be useful to return.
 
 Some issues could arise during the removal phase, as the components currently available
 to remove the keys do not work with the CTor keystore (`Keystore::remove_unchecked`).
