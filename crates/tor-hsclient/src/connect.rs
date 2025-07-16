@@ -18,6 +18,7 @@ use tor_cell::relaycell::hs::intro_payload::{self, IntroduceHandshakePayload};
 use tor_cell::relaycell::hs::pow::ProofOfWork;
 use tor_cell::relaycell::msg::{AnyRelayMsg, Introduce1, Rendezvous2};
 use tor_circmgr::build::onion_circparams_from_netparams;
+use tor_dirclient::SourceInfo;
 use tor_error::{debug_report, warn_report, Bug};
 use tor_hscrypto::Subcredential;
 use tor_proto::circuit::handshake::hs_ntor;
@@ -431,6 +432,7 @@ impl<'c, R: Runtime, M: MocksForConnect<R>> Context<'c, R, M> {
     ///
     /// Does all necessary retries and timeouts.
     /// Returns an error if no valid descriptor could be found.
+    #[allow(clippy::cognitive_complexity)] // TODO: Refactor
     async fn descriptor_ensure<'d>(&self, data: &'d mut DataHsDesc) -> Result<&'d HsDesc, CE> {
         // Maximum number of hsdir connection and retrieval attempts we'll make
         let max_total_attempts = self
@@ -508,13 +510,26 @@ impl<'c, R: Runtime, M: MocksForConnect<R>> Context<'c, R, M> {
             {
                 Ok(desc) => break desc,
                 Err(error) => {
-                    debug_report!(
-                        &error,
-                        "failed hsdir desc fetch for {} from {}/{}",
-                        &self.hsid,
-                        &relay.id(),
-                        &relay.rsa_id()
-                    );
+                    if error.should_report_as_suspicious() {
+                        // Note that not every protocol violation is suspicious:
+                        // we only warn on the protocol violations that look like attempts
+                        // to do a traffic tagging attack via hsdir inflation.
+                        // (See proposal 360.)
+                        warn_report!(
+                            &error,
+                            "Suspicious failure while downloading hsdesc for {} from relay {}",
+                            &self.hsid,
+                            relay.display_relay_ids(),
+                        );
+                    } else {
+                        debug_report!(
+                            &error,
+                            "failed hsdir desc fetch for {} from {}/{}",
+                            &self.hsid,
+                            &relay.id(),
+                            &relay.rsa_id()
+                        );
+                    }
                     errors.push(tor_error::Report(DescriptorError {
                         hsdir: hsdir_for_error,
                         error,
@@ -577,12 +592,15 @@ impl<'c, R: Runtime, M: MocksForConnect<R>> Context<'c, R, M> {
                 OwnedCircTarget::from_circ_target(hsdir),
             )
             .await?;
+        let source: Option<SourceInfo> = circuit
+            .m_source_info()
+            .map_err(into_internal!("Couldn't get SourceInfo for circuit"))?;
         let mut stream = circuit
             .m_begin_dir_stream()
             .await
             .map_err(DescriptorErrorDetail::Stream)?;
 
-        let response = tor_dirclient::send_request(self.runtime, &request, &mut stream, None)
+        let response = tor_dirclient::send_request(self.runtime, &request, &mut stream, source)
             .await
             .map_err(|dir_error| match dir_error {
                 tor_dirclient::Error::RequestFailed(rfe) => DescriptorErrorDetail::from(rfe.error),
@@ -1060,6 +1078,7 @@ impl<'c, R: Runtime, M: MocksForConnect<R>> Context<'c, R, M> {
     /// So if there's a failure, it's purely to do with the introduction point.
     ///
     /// Does not apply a timeout.
+    #[allow(clippy::cognitive_complexity)] // TODO: Refactor
     async fn exchange_introduce(
         &'c self,
         ipt: &UsableIntroPt<'_>,
@@ -1282,6 +1301,11 @@ impl<'c, R: Runtime, M: MocksForConnect<R>> Context<'c, R, M> {
 
         let params = onion_circparams_from_netparams(self.netdir.params())
             .map_err(into_internal!("Failed to build CircParameters"))?;
+        // TODO: We may be able to infer more about the supported protocols of the other side from our
+        // handshake, and from its descriptors.
+        //
+        // TODO CC: This is relevant for congestion control!
+        let protocols = self.netdir.client_protocol_status().required_protocols();
 
         rendezvous
             .rend_circ
@@ -1290,6 +1314,7 @@ impl<'c, R: Runtime, M: MocksForConnect<R>> Context<'c, R, M> {
                 handshake::HandshakeRole::Initiator,
                 keygen,
                 params,
+                protocols,
             )
             .await
             .map_err(into_internal!(
@@ -1407,6 +1432,9 @@ trait MockableClientCirc: Debug {
     where
         Self: 'r;
 
+    /// Get a tor_dirclient::SourceInfo for this circuit, if possible.
+    fn m_source_info(&self) -> tor_proto::Result<Option<SourceInfo>>;
+
     /// Add a virtual hop to the circuit.
     async fn m_extend_virtual(
         &self,
@@ -1414,6 +1442,7 @@ trait MockableClientCirc: Debug {
         role: tor_proto::circuit::handshake::HandshakeRole,
         handshake: impl tor_proto::circuit::handshake::KeyGenerator + Send,
         params: CircParameters,
+        capabilities: &tor_protover::Protocols,
     ) -> tor_proto::Result<()>;
 }
 
@@ -1458,8 +1487,8 @@ impl MockableClientCirc for ClientCirc {
         msg: Option<AnyRelayMsg>,
         reply_handler: impl MsgHandler + Send + 'static,
     ) -> tor_proto::Result<Self::Conversation<'_>> {
-        let last_hop = self.last_hop_num()?;
-        ClientCirc::start_conversation(self, msg, reply_handler, last_hop).await
+        ClientCirc::start_conversation(self, msg, reply_handler, tor_proto::TargetHop::LastHop)
+            .await
     }
     type Conversation<'r> = tor_proto::circuit::Conversation<'r>;
 
@@ -1469,8 +1498,14 @@ impl MockableClientCirc for ClientCirc {
         role: tor_proto::circuit::handshake::HandshakeRole,
         handshake: impl tor_proto::circuit::handshake::KeyGenerator + Send,
         params: CircParameters,
+        capabilities: &tor_protover::Protocols,
     ) -> tor_proto::Result<()> {
-        ClientCirc::extend_virtual(self, protocol, role, handshake, params).await
+        ClientCirc::extend_virtual(self, protocol, role, handshake, &params, capabilities).await
+    }
+
+    /// Get a tor_dirclient::SourceInfo for this circuit, if possible.
+    fn m_source_info(&self) -> tor_proto::Result<Option<SourceInfo>> {
+        SourceInfo::from_circuit(self)
     }
 }
 
@@ -1626,8 +1661,14 @@ mod test {
             role: tor_proto::circuit::handshake::HandshakeRole,
             handshake: impl tor_proto::circuit::handshake::KeyGenerator + Send,
             params: CircParameters,
+            capabilities: &tor_protover::Protocols,
         ) -> tor_proto::Result<()> {
             todo!()
+        }
+
+        /// Get a tor_dirclient::SourceInfo for this circuit, if possible.
+        fn m_source_info(&self) -> tor_proto::Result<Option<SourceInfo>> {
+            Ok(None)
         }
     }
 

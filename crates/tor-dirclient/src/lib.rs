@@ -89,11 +89,19 @@ where
 
     // TODO(nickm) This should be an option, and is too long.
     let begin_timeout = Duration::from_secs(5);
-    let source = SourceInfo::from_circuit(&circuit);
+    let source = match SourceInfo::from_circuit(&circuit) {
+        Ok(source) => source,
+        Err(e) => {
+            return Err(Error::RequestFailed(RequestFailedError {
+                source: None,
+                error: e.into(),
+            }));
+        }
+    };
 
     let wrap_err = |error| {
         Error::RequestFailed(RequestFailedError {
-            source: Some(source.clone()),
+            source: source.clone(),
             error,
         })
     };
@@ -102,7 +110,7 @@ where
 
     // Launch the stream.
     let mut stream = runtime
-        .timeout(begin_timeout, circuit.begin_dir_stream())
+        .timeout(begin_timeout, circuit.clone().begin_dir_stream())
         .await
         .map_err(RequestError::from)
         .map_err(wrap_err)?
@@ -111,10 +119,10 @@ where
 
     // TODO: Perhaps we want separate timeouts for each phase of this.
     // For now, we just use higher-level timeouts in `dirmgr`.
-    let r = send_request(runtime, req, &mut stream, Some(source.clone())).await;
+    let r = send_request(runtime, req, &mut stream, source.clone()).await;
 
     if should_retire_circ(&r) {
-        retire_circ(&circ_mgr, &source, "Partial response");
+        retire_circ(&circ_mgr, &circuit.unique_id(), "Partial response");
     }
 
     r
@@ -234,6 +242,11 @@ where
     Ok(DirResponse::new(200, None, ok.err(), result, source))
 }
 
+/// Maximum length for the HTTP headers in a single request or response.
+///
+/// Chosen more or less arbitrarily.
+const MAX_HEADERS_LEN: usize = 16384;
+
 /// Read and parse HTTP/1 headers from `stream`.
 async fn read_headers<S>(stream: &mut S) -> RequestResult<HeaderStatus>
 where
@@ -260,9 +273,8 @@ where
                     return Err(RequestError::TruncatedHeaders);
                 }
 
-                // TODO(nickm): Pick a better maximum
-                if buf.len() >= 16384 {
-                    return Err(httparse::Error::TooManyHeaders.into());
+                if buf.len() >= MAX_HEADERS_LEN {
+                    return Err(RequestError::HeadersTooLong(buf.len()));
                 }
             }
             httparse::Status::Complete(n_parsed) => {
@@ -388,11 +400,10 @@ where
 }
 
 /// Retire a directory circuit because of an error we've encountered on it.
-fn retire_circ<R>(circ_mgr: &Arc<CircMgr<R>>, source_info: &SourceInfo, error: &str)
+fn retire_circ<R>(circ_mgr: &Arc<CircMgr<R>>, id: &tor_proto::circuit::UniqId, error: &str)
 where
     R: Runtime,
 {
-    let id = source_info.unique_circ_id();
     info!(
         "{}: Retiring circuit because of directory failure: {}",
         &id, &error
@@ -736,7 +747,7 @@ mod test {
 
         let request = request?;
         assert!(request[..].starts_with(
-            b"GET /tor/micro/d/CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk.z HTTP/1.0\r\n"
+            b"GET /tor/micro/d/CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk HTTP/1.0\r\n"
         ));
 
         let response = response.unwrap();
@@ -831,7 +842,7 @@ mod test {
         assert!(matches!(
             response,
             Err(Error::RequestFailed(RequestFailedError {
-                error: RequestError::HttparseError(_),
+                error: RequestError::HeadersTooLong(_),
                 ..
             }))
         ));

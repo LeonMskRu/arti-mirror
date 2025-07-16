@@ -40,10 +40,18 @@ pub mod isolation;
 mod mgr;
 #[cfg(test)]
 mod mocks;
-pub(crate) mod path;
 mod preemptive;
 pub mod timeouts;
 mod usage;
+
+// Can't apply `visibility` to modules.
+cfg_if::cfg_if! {
+    if #[cfg(feature = "experimental-api")] {
+        pub mod path;
+    } else {
+        pub(crate) mod path;
+    }
+}
 
 pub use err::Error;
 pub use isolation::IsolationToken;
@@ -69,7 +77,7 @@ use tor_persist::StateMgr;
 use tor_rtcompat::scheduler::{TaskHandle, TaskSchedule};
 
 #[cfg(feature = "hs-common")]
-use crate::hspool::HsCircStemKind;
+use crate::hspool::{HsCircKind, HsCircStemKind};
 #[cfg(all(feature = "vanguards", feature = "hs-common"))]
 use tor_guardmgr::vanguards::VanguardMgr;
 
@@ -731,6 +739,7 @@ impl<B: AbstractCircBuilder<R> + 'static, R: Runtime> CircMgrInner<B, R> {
     /// Exit when we notice that `circmgr` has been dropped.
     ///
     /// This is a daemon task: it runs indefinitely in the background.
+    #[allow(clippy::cognitive_complexity)] // because of tracing
     async fn update_persistent_state<S>(
         mut sched: TaskSchedule<R>,
         circmgr: Weak<Self>,
@@ -856,6 +865,7 @@ impl<B: AbstractCircBuilder<R> + 'static, R: Runtime> CircMgrInner<B, R> {
     ///
     /// This function is invoked periodically from
     /// `continually_preemptively_build_circuits()`.
+    #[allow(clippy::cognitive_complexity)]
     async fn launch_circuits_preemptively(
         &self,
         netdir: DirInfo<'_>,
@@ -906,8 +916,12 @@ impl<B: AbstractCircBuilder<R> + 'static, R: Runtime> CircMgrInner<B, R> {
         }
     }
 
-    /// Create and return a new (typically anonymous) circuit for use as an
-    /// onion service circuit of type `kind`.
+    /// Create and return a new (typically anonymous) onion circuit stem
+    /// of type `stem_kind`.
+    ///
+    /// If `circ_kind` is provided, we apply additional rules to make sure
+    /// that this will be usable as a stem for the given kind of onion service circuit.
+    /// Otherwise, we pick a stem that will probably be useful in general.
     ///
     /// This circuit is guaranteed not to have been used for any traffic
     /// previously, and it will not be given out for any other requests in the
@@ -923,14 +937,16 @@ impl<B: AbstractCircBuilder<R> + 'static, R: Runtime> CircMgrInner<B, R> {
         &self,
         planned_target: Option<T>,
         dir: &NetDir,
-        kind: HsCircStemKind,
+        stem_kind: HsCircStemKind,
+        circ_kind: Option<HsCircKind>,
     ) -> Result<Arc<B::Circ>>
     where
         T: IntoOwnedChanTarget,
     {
         let usage = TargetCircUsage::HsCircBase {
             compatible_with_target: planned_target.map(IntoOwnedChanTarget::to_owned),
-            kind,
+            stem_kind,
+            circ_kind,
         };
         let (_, client_circ) = self.mgr.launch_unmanaged(&usage, dir.into()).await?;
         Ok(client_circ)
@@ -1150,6 +1166,7 @@ mod test {
                                 None,
                                 &netdir,
                                 HsCircStemKind::Naive,
+                                None,
                             )
                             .await,
                     )

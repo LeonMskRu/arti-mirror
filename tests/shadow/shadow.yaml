@@ -1,5 +1,25 @@
 general:
   stop_time: 30 min
+  model_unblocked_syscall_latency: True
+experimental:
+  # shadow only actually increments simulated time (and potentially
+  # switches threads) if this much time would have been consumed by an
+  # unbroken sequence of unblocked syscalls. Using a relatively large
+  # value here (vs the default 1us) makes the simulation scheduling
+  # more stable and predictable; e.g. adding additional logging to
+  # debug an issue is less likely to make the issue disappear.
+  #
+  # The primary tradeoffs are:
+  # * Time will move forward at a larger granularity when unblocked syscall
+  #   latency is applied. 10ms is still small enough though that this
+  #   shouldn't be terribly strange; e.g. larger time jumps are likely
+  #   to be observed on over-loaded systems with normal preemptive
+  #   scheduling.
+  # * when the simulation does hit a
+  #   busy loop, it may spend a bit longer "spinning" before moving
+  #   time forward, potentially causing the simulation to take a bit
+  #   longer to run. (if it would have otherwise timed out earlier than 10ms)
+  max_unapplied_cpu_latency: "10ms"
 network:
   graph:
     type: gml
@@ -64,7 +84,9 @@ hosts:
       - -p=0
       - -d=0
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -92,7 +114,9 @@ hosts:
       - -p=0
       - -d=0
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -121,7 +145,9 @@ hosts:
       - -p=0
       - -d=0
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -151,7 +177,9 @@ hosts:
       - -p=0
       - -d=0
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -256,7 +284,9 @@ hosts:
       - -c=./arti.d/arti.common.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -280,7 +310,9 @@ hosts:
       - -c=./arti.d/arti.extra.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -307,7 +339,9 @@ hosts:
       - -c=./arti.d/arti.bridge.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -335,7 +369,9 @@ hosts:
       - -c=./arti.d/arti.obfs4-client.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -357,7 +393,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -379,7 +417,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -401,7 +441,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -431,7 +473,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -462,7 +506,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -485,7 +531,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -509,7 +557,9 @@ hosts:
       - -c=./arti.d/arti-auth-ctor.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home

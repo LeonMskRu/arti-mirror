@@ -125,7 +125,7 @@ pub struct Connector<R: Runtime> {
     #[educe(Debug(ignore))]
     client: TorClient<R>,
 
-    /// Selected [`ureq::tls::TlsProvider`]. Possibile options are `Rustls` or `NativeTls`. The default is `Rustls`.
+    /// Selected [`ureq::tls::TlsProvider`]. Possible options are `Rustls` or `NativeTls`. The default is `Rustls`.
     tls_provider: UreqTlsProvider,
 }
 
@@ -272,7 +272,7 @@ impl std::convert::From<Error> for ureq::Error {
             Error::UnsupportedUriScheme { uri } => {
                 ureq::Error::BadUri(format!("Unsupported URI scheme in {uri:?}"))
             }
-            Error::Arti(e) => ureq::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)), // TODO #1858
+            Error::Arti(e) => ureq::Error::Io(std::io::Error::other(e)), // TODO #1858
             Error::Io(e) => ureq::Error::Io(e),
             Error::TlsConfigMismatch => {
                 ureq::Error::Tls("TLS provider in config does not match the one in Connector.")
@@ -312,10 +312,6 @@ impl<R: Runtime + ToplevelBlockOn> Transport for HttpTransport<R> {
 
     // Read data from arti stream to ureq buffer.
     fn await_input(&mut self, _timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        if self.buffers().can_use_input() {
-            return Ok(true);
-        }
-
         let mut reader = self.r.lock().expect("lock poisoned");
 
         let buffers = self.buffer.input_append_buf();
@@ -645,7 +641,7 @@ mod arti_ureq_test {
     // complex to use the `==` operator or (Partial)Eq. So we compare the types of the individual properties instead.
     fn assert_equal_types<T>(_: &T, _: &T) {}
 
-    // Helper function to check if the enviroment variable ARTI_TEST_LIVE_NETWORK is set to 1.
+    // Helper function to check if the environment variable ARTI_TEST_LIVE_NETWORK is set to 1.
     // We only want to run tests using the live network when the user explicitly wants to.
     fn test_live_network() -> bool {
         let run_test = std::env::var(ARTI_TEST_LIVE_NETWORK).is_ok_and(|v| v == "1");
@@ -656,7 +652,7 @@ mod arti_ureq_test {
         run_test
     }
 
-    // Helper function to check if the enviroment variable ARTI_TESTING_ON_LOCAL is set to 1.
+    // Helper function to check if the environment variable ARTI_TESTING_ON_LOCAL is set to 1.
     // Some tests, especially those that create default `Connector` instances, or test the `ConnectorBuilder`,
     // are not reliable when run on CI.  We don't know why that is.  It's probably a bug.  TODO fix the tests!
     fn testing_on_local() -> bool {

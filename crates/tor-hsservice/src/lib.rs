@@ -24,6 +24,7 @@ mod ipt_lid;
 mod ipt_mgr;
 mod ipt_set;
 mod keys;
+mod pow;
 mod publish;
 mod rend_handshake;
 mod replay;
@@ -49,6 +50,8 @@ pub mod time_store_for_doctests_unstable_no_semver_guarantees {
     pub use crate::time_store::*;
 }
 
+use std::pin::Pin;
+
 use internal_prelude::*;
 
 // ---------- public exports ----------
@@ -61,6 +64,7 @@ pub use keys::{
     BlindIdKeypairSpecifier, BlindIdPublicKeySpecifier, DescSigningKeypairSpecifier,
     HsIdKeypairSpecifier, HsIdPublicKeySpecifier,
 };
+use pow::{NewPowManager, PowManager};
 pub use publish::UploadError as DescUploadError;
 pub use req::{RendRequest, StreamRequest};
 pub use tor_hscrypto::pk::HsId;
@@ -108,8 +112,9 @@ struct SvcInner {
     status_tx: StatusSender,
 
     /// Handles that we'll take ownership of when launching the service.
+    #[allow(clippy::type_complexity)]
     unlaunched: Option<(
-        mpsc::Receiver<RendRequest>,
+        Pin<Box<dyn Stream<Item = RendRequest> + Send + Sync>>,
         Box<dyn Launchable + Send + Sync>,
     )>,
 }
@@ -134,6 +139,9 @@ struct ForLaunch<R: Runtime> {
     ///
     ///
     ipt_mgr_view: IptsManagerView,
+
+    /// Proof-of-work manager.
+    pow_manager: Arc<PowManager<R>>,
 }
 
 /// Private trait used to type-erase `ForLaunch<R>`, so that we don't need to
@@ -147,6 +155,7 @@ impl<R: Runtime> Launchable for ForLaunch<R> {
     fn launch(self: Box<Self>) -> Result<(), StartupError> {
         self.ipt_mgr.launch_background_tasks(self.ipt_mgr_view)?;
         self.publisher.launch()?;
+        self.pow_manager.launch()?;
 
         Ok(())
     }
@@ -253,9 +262,24 @@ impl OnionService {
             .storage_handle("iptpub")
             .map_err(StartupError::StateDirectoryInaccessible)?;
 
-        // If the HS implementation is stalled somehow, this is a local problem.
-        // We shouldn't kill the HS even if this is the oldest data in the system.
-        let (rend_req_tx, rend_req_rx) = mpsc_channel_no_memquota(32);
+        let pow_manager_storage_handle = state_handle
+            .storage_handle("pow_manager")
+            .map_err(StartupError::StateDirectoryInaccessible)?;
+        let pow_nonce_dir = state_handle
+            .raw_subdir("pow_nonces")
+            .map_err(StartupError::StateDirectoryInaccessible)?;
+        let NewPowManager {
+            pow_manager,
+            rend_req_tx,
+            rend_req_rx,
+            publisher_update_rx,
+        } = PowManager::new(
+            runtime.clone(),
+            nickname.clone(),
+            pow_nonce_dir,
+            keymgr.clone(),
+            pow_manager_storage_handle,
+        )?;
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(0);
         let (config_tx, config_rx) = postage::watch::channel_with(Arc::new(config));
@@ -290,6 +314,8 @@ impl OnionService {
             status_tx.clone().into(),
             Arc::clone(&keymgr),
             path_resolver,
+            pow_manager.clone(),
+            publisher_update_rx,
         );
 
         let svc = Arc::new(RunningOnionService {
@@ -305,6 +331,7 @@ impl OnionService {
                         publisher,
                         ipt_mgr,
                         ipt_mgr_view,
+                        pow_manager,
                     }),
                 )),
             }),

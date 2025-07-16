@@ -29,11 +29,11 @@ impl mgr::AbstractCirc for tor_proto::circuit::ClientCirc {
         !self.is_closing()
     }
 
-    fn path_ref(&self) -> Arc<Path> {
+    fn path_ref(&self) -> tor_proto::Result<Arc<Path>> {
         self.path_ref()
     }
 
-    fn n_hops(&self) -> usize {
+    fn n_hops(&self) -> tor_proto::Result<usize> {
         self.n_hops()
     }
 
@@ -45,12 +45,13 @@ impl mgr::AbstractCirc for tor_proto::circuit::ClientCirc {
         self.unique_id()
     }
 
-    async fn extend_ntor<T: CircTarget + std::marker::Sync>(
+    async fn extend<T: CircTarget + std::marker::Sync>(
         &self,
         target: &T,
         params: CircParameters,
     ) -> tor_proto::Result<()> {
-        self.extend_ntor(target, params).await
+        // Use 'ClientCirc::' name to avoid invoking _this_ method.
+        ClientCirc::extend(self, target, params).await
     }
 }
 

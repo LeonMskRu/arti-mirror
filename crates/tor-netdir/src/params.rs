@@ -26,7 +26,7 @@ use tor_units::{
 /// Upper limit for channel padding timeouts
 ///
 /// This is just a safety catch which might help prevent integer overflow,
-/// and also might prevent a client getting permantently stuck in a state
+/// and also might prevent a client getting permanently stuck in a state
 /// where it ought to send padding but never does.
 ///
 /// The actual value is stolen from C Tor as per
@@ -43,46 +43,110 @@ pub trait FromInt32Saturating {
     /// valid.  If `val` is too high, treat it as the highest value that
     /// would be valid.
     fn from_saturating(val: i32) -> Self;
+
+    /// Try to construct an instance of this object from `val`.
+    ///
+    /// If `val` is out of range, return an error instead.
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized;
 }
 
 impl FromInt32Saturating for i32 {
     fn from_saturating(val: i32) -> Self {
         val
     }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(val)
+    }
 }
 impl<const L: i32, const H: i32> FromInt32Saturating for BoundedInt32<L, H> {
     fn from_saturating(val: i32) -> Self {
         Self::saturating_new(val)
+    }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Self::checked_new(val)
     }
 }
 impl<T: Copy + Into<f64> + FromInt32Saturating> FromInt32Saturating for Percentage<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
     }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
+    }
 }
 impl<T: FromInt32Saturating + TryInto<u64>> FromInt32Saturating for IntegerMilliseconds<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
+    }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
     }
 }
 impl<T: FromInt32Saturating + TryInto<u64>> FromInt32Saturating for IntegerSeconds<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
     }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
+    }
 }
 impl<T: FromInt32Saturating + TryInto<u64>> FromInt32Saturating for IntegerMinutes<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
+    }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
     }
 }
 impl<T: FromInt32Saturating + TryInto<u64>> FromInt32Saturating for IntegerDays<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
     }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
+    }
 }
 impl FromInt32Saturating for SendMeVersion {
     fn from_saturating(val: i32) -> Self {
         Self::new(val.clamp(0, 255) as u8)
+    }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        let val = BoundedInt32::<0, 255>::checked_new(val)?;
+        Ok(Self::new(val.get() as u8))
     }
 }
 
@@ -129,7 +193,13 @@ macro_rules! declare_net_parameters {
                 match key {
                     $( $p_string => self.$p_name = {
                         type T = $p_type;
-                        T::from_saturating(val)
+                        match T::from_checked(val) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("For key {key}, clamping out of range value: {e:?}");
+                                T::from_saturating(val)
+                            }
+                        }
                     }, )*
                     _ => return false,
                 }
@@ -438,12 +508,22 @@ pub struct NetParameters {
     pub hs_intro_num_extra_intropoints: BoundedInt32<0, 128> = (2)
         from "hs_intro_num_extra",
 
+    /// Largest number of allowable relay cells received
+    /// in reply to an hsdir download attempt.
+    pub hsdir_dl_max_reply_cells: BoundedInt32<2, 2304> = (110)
+        from "hsdir_dl_max_reply_cells",
+
+    /// Largest number of allowable relay cells received
+    /// in reply to an hsdir upload attempt.
+    pub hsdir_ul_max_reply_cells: BoundedInt32<2, 1024> = (8)
+        from "hsdir_ul_max_reply_cells",
+
     /// The duration of a time period, as used in the onion service directory
     /// protocol.
     ///
     /// During each "time period", each onion service gets a different blinded
     /// ID, and the hash ring gets a new layout.
-    pub hsdir_timeperiod_length: IntegerMinutes<BoundedInt32<30, 14400>> = (1440)
+    pub hsdir_timeperiod_length: IntegerMinutes<BoundedInt32<5, 14400>> = (1440)
         from "hsdir_interval",
 
     /// The number of positions at the hash ring where an onion service
@@ -622,7 +702,10 @@ impl NetParameters {
     /// Unrecognized parameters are ignored.
     pub fn from_map(p: &tor_netdoc::doc::netstatus::NetParams<i32>) -> Self {
         let mut params = NetParameters::default();
-        let _ = params.saturating_update(p.iter());
+        let unrecognized = params.saturating_update(p.iter());
+        for u in unrecognized {
+            tracing::debug!("Ignored unrecognized net param: {u}");
+        }
         params
     }
 

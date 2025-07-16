@@ -156,11 +156,17 @@ impl DirResponse {
 }
 
 impl SourceInfo {
-    /// Construct a new SourceInfo
-    pub(crate) fn from_circuit(circuit: &ClientCirc) -> Self {
-        SourceInfo {
-            circuit: circuit.unique_id(),
-            cache_id: circuit.first_hop().into(),
+    /// Try to construct a new SourceInfo representing the last hop of a given circuit.
+    ///
+    /// Return an error if the circuit is closed;
+    /// return `Ok(None)` if the circuit's last hop is virtual.
+    pub fn from_circuit(circuit: &ClientCirc) -> tor_proto::Result<Option<Self>> {
+        match circuit.last_hop_info()? {
+            None => Ok(None),
+            Some(last_hop) => Ok(Some(SourceInfo {
+                circuit: circuit.unique_id(),
+                cache_id: last_hop.into(),
+            })),
         }
     }
 

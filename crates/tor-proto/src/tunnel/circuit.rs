@@ -12,8 +12,10 @@
 //! To build a circuit, first create a [crate::channel::Channel], then
 //! call its [crate::channel::Channel::new_circ] method.  This yields
 //! a [PendingClientCirc] object that won't become live until you call
-//! one of the methods that extends it to its first hop.  After you've
-//! done that, you can call [ClientCirc::extend_ntor] on the circuit to
+//! one of the methods
+//! (typically [`PendingClientCirc::create_firsthop`])
+//! that extends it to its first hop.  After you've
+//! done that, you can call [`ClientCirc::extend`] on the circuit to
 //! build it into a multi-hop circuit.  Finally, you can use
 //! [ClientCirc::begin_stream] to get a Stream object that can be used
 //! for anonymized data.
@@ -51,24 +53,27 @@ use crate::crypto::handshake::ntor_v3::NtorV3PublicKey;
 use crate::memquota::{CircuitAccount, SpecificAccount as _};
 use crate::stream::{
     AnyCmdChecker, DataCmdChecker, DataStream, ResolveCmdChecker, ResolveStream, StreamParameters,
-    StreamReader,
+    StreamRateLimit, StreamReceiver,
 };
 use crate::tunnel::circuit::celltypes::*;
 use crate::tunnel::reactor::CtrlCmd;
 use crate::tunnel::reactor::{
     CircuitHandshake, CtrlMsg, Reactor, RECV_WINDOW_INIT, STREAM_READER_BUFFER,
 };
-use crate::tunnel::{HopLocation, LegId, StreamTarget, TargetHop};
+use crate::tunnel::{StreamTarget, TargetHop};
 use crate::util::skew::ClockSkew;
 use crate::{Error, ResolveError, Result};
 use educe::Educe;
+use path::HopDetail;
+use postage::watch;
 use tor_cell::{
     chancell::CircId,
     relaycell::msg::{AnyRelayMsg, Begin, Resolve, Resolved, ResolvedVal},
 };
 
-use tor_error::{internal, into_internal};
+use tor_error::{bad_api_usage, internal, into_internal};
 use tor_linkspec::{CircTarget, LinkSpecType, OwnedChanTarget, RelayIdType};
+use tor_protover::named;
 
 pub use crate::crypto::binding::CircuitBinding;
 pub use crate::memquota::StreamAccount;
@@ -86,6 +91,7 @@ use oneshot_fused_workaround as oneshot;
 use crate::congestion::sendme::StreamRecvWindow;
 use crate::DynTimeProvider;
 use futures::FutureExt as _;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tor_memquota::mq_queue::{self, ChannelSpec as _, MpscSpec};
@@ -122,11 +128,11 @@ pub(crate) type CircuitRxReceiver = mq_queue::Receiver<ClientCircChanMsg, MpscSp
 ///
 /// `ClientCirc`s are created in an initially unusable state using [`Channel::new_circ`],
 /// which returns a [`PendingClientCirc`].  To get a real (one-hop) circuit from
-/// one of these, you invoke one of its `create_firsthop` methods (currently
+/// one of these, you invoke one of its `create_firsthop` methods (typically
 /// [`create_firsthop_fast()`](PendingClientCirc::create_firsthop_fast) or
-/// [`create_firsthop_ntor()`](PendingClientCirc::create_firsthop_ntor)).
+/// [`create_firsthop()`](PendingClientCirc::create_firsthop)).
 /// Then, to add more hops to the circuit, you can call
-/// [`extend_ntor()`](ClientCirc::extend_ntor) on it.
+/// [`extend()`](ClientCirc::extend) on it.
 ///
 /// For higher-level APIs, see the `tor-circmgr` crate: the ones here in
 /// `tor-proto` are probably not what you need.
@@ -160,7 +166,7 @@ pub(crate) type CircuitRxReceiver = mq_queue::Receiver<ClientCircChanMsg, MpscSp
 //
 pub struct ClientCirc {
     /// Mutable state shared with the `Reactor`.
-    mutable: Arc<Mutex<MutableState>>,
+    mutable: Arc<TunnelMutableState>,
     /// A unique identifier for this circuit.
     unique_id: UniqId,
     /// Channel to send control messages to the reactor.
@@ -180,16 +186,186 @@ pub struct ClientCirc {
     time_provider: DynTimeProvider,
 }
 
-/// Mutable state shared by [`ClientCirc`] and [`Reactor`].
+/// The mutable state of a tunnel, shared between [`ClientCirc`] and [`Reactor`].
+///
+/// NOTE(gabi): this mutex-inside-a-mutex might look suspicious,
+/// but it is currently the best option we have for sharing
+/// the circuit state with `ClientCirc` (and soon, with `ClientTunnel`).
+/// In practice, these mutexes won't be accessed very often
+/// (they're accessed for writing when a circuit is extended,
+/// and for reading by the various `ClientCirc` APIs),
+/// so they shouldn't really impact performance.
+///
+/// Alternatively, the circuit state information could be shared
+/// outside the reactor through a channel (passed to the reactor via a `CtrlCmd`),
+/// but in #1840 @opara notes that involves making the `ClientCirc` accessors
+/// (`ClientCirc::path`, `ClientCirc::binding_key`, etc.)
+/// asynchronous, which will significantly complicate their callsites,
+/// which would in turn need to be made async too.
+///
+/// We should revisit this decision at some point, and decide whether an async API
+/// would be preferable.
+#[derive(Debug, Default)]
+pub(super) struct TunnelMutableState(Mutex<HashMap<UniqId, Arc<MutableState>>>);
+
+impl TunnelMutableState {
+    /// Add the [`MutableState`] of a circuit.
+    pub(super) fn insert(&self, unique_id: UniqId, mutable: Arc<MutableState>) {
+        #[allow(unused)] // unused in non-debug builds
+        let state = self
+            .0
+            .lock()
+            .expect("lock poisoned")
+            .insert(unique_id, mutable);
+
+        debug_assert!(state.is_none());
+    }
+
+    /// Remove the [`MutableState`] of a circuit.
+    pub(super) fn remove(&self, unique_id: UniqId) {
+        #[allow(unused)] // unused in non-debug builds
+        let state = self.0.lock().expect("lock poisoned").remove(&unique_id);
+
+        debug_assert!(state.is_some());
+    }
+
+    /// Return a [`Path`] object describing all the hops in the specified circuit.
+    ///
+    /// See [`MutableState::path`].
+    fn path_ref(&self, unique_id: UniqId) -> Result<Arc<Path>> {
+        let lock = self.0.lock().expect("lock poisoned");
+        let mutable = lock
+            .get(&unique_id)
+            .ok_or_else(|| bad_api_usage!("no circuit with unique ID {unique_id}"))?;
+
+        Ok(mutable.path())
+    }
+
+    /// Return a description of the first hop of this circuit.
+    ///
+    /// Returns an error if a circuit with the specified [`UniqId`] doesn't exist.
+    /// Returns `Ok(None)` if the specified circuit doesn't have any hops.
+    fn first_hop(&self, unique_id: UniqId) -> Result<Option<OwnedChanTarget>> {
+        let lock = self.0.lock().expect("lock poisoned");
+        let mutable = lock
+            .get(&unique_id)
+            .ok_or_else(|| bad_api_usage!("no circuit with unique ID {unique_id}"))?;
+
+        let first_hop = mutable.first_hop().map(|first_hop| match first_hop {
+            path::HopDetail::Relay(r) => r,
+            #[cfg(feature = "hs-common")]
+            path::HopDetail::Virtual => {
+                panic!("somehow made a circuit with a virtual first hop.")
+            }
+        });
+
+        Ok(first_hop)
+    }
+
+    /// Return the [`HopNum`] of the last hop of the specified circuit.
+    ///
+    /// Returns an error if a circuit with the specified [`UniqId`] doesn't exist.
+    ///
+    /// See [`MutableState::last_hop_num`].
+    fn last_hop_num(&self, unique_id: UniqId) -> Result<Option<HopNum>> {
+        let lock = self.0.lock().expect("lock poisoned");
+        let mutable = lock
+            .get(&unique_id)
+            .ok_or_else(|| bad_api_usage!("no circuit with unique ID {unique_id}"))?;
+
+        Ok(mutable.last_hop_num())
+    }
+
+    /// Return the number of hops in the specified circuit.
+    ///
+    /// See [`MutableState::n_hops`].
+    fn n_hops(&self, unique_id: UniqId) -> Result<usize> {
+        let lock = self.0.lock().expect("lock poisoned");
+        let mutable = lock
+            .get(&unique_id)
+            .ok_or_else(|| bad_api_usage!("no circuit with unique ID {unique_id}"))?;
+
+        Ok(mutable.n_hops())
+    }
+
+    /// Return the number of legs in this tunnel.
+    ///
+    /// TODO(conflux-fork): this can be removed once we modify `path_ref`
+    /// to return *all* the Paths in the tunnel.
+    fn n_legs(&self) -> usize {
+        let lock = self.0.lock().expect("lock poisoned");
+        lock.len()
+    }
+}
+
+/// The mutable state of a circuit.
 #[derive(Educe, Default)]
 #[educe(Debug)]
-pub(super) struct MutableState {
+pub(super) struct MutableState(Mutex<CircuitState>);
+
+impl MutableState {
+    /// Add a hop to the path of this circuit.
+    pub(super) fn add_hop(&self, peer_id: HopDetail, binding: Option<CircuitBinding>) {
+        let mut mutable = self.0.lock().expect("poisoned lock");
+        Arc::make_mut(&mut mutable.path).push_hop(peer_id);
+        mutable.binding.push(binding);
+    }
+
+    /// Get a copy of the circuit's current [`path::Path`].
+    pub(super) fn path(&self) -> Arc<path::Path> {
+        let mutable = self.0.lock().expect("poisoned lock");
+        Arc::clone(&mutable.path)
+    }
+
+    /// Return the cryptographic material used to prove knowledge of a shared
+    /// secret with with `hop`.
+    pub(super) fn binding_key(&self, hop: HopNum) -> Option<CircuitBinding> {
+        let mutable = self.0.lock().expect("poisoned lock");
+
+        mutable.binding.get::<usize>(hop.into()).cloned().flatten()
+        // NOTE: I'm not thrilled to have to copy this information, but we use
+        // it very rarely, so it's not _that_ bad IMO.
+    }
+
+    /// Return a description of the first hop of this circuit.
+    fn first_hop(&self) -> Option<HopDetail> {
+        let mutable = self.0.lock().expect("poisoned lock");
+        mutable.path.first_hop()
+    }
+
+    /// Return the [`HopNum`] of the last hop of this circuit.
+    ///
+    /// NOTE: This function will return the [`HopNum`] of the hop
+    /// that is _currently_ the last. If there is an extend operation in progress,
+    /// the currently pending hop may or may not be counted, depending on whether
+    /// the extend operation finishes before this call is done.
+    fn last_hop_num(&self) -> Option<HopNum> {
+        let mutable = self.0.lock().expect("poisoned lock");
+        mutable.path.last_hop_num()
+    }
+
+    /// Return the number of hops in this circuit.
+    ///
+    /// NOTE: This function will currently return only the number of hops
+    /// _currently_ in the circuit. If there is an extend operation in progress,
+    /// the currently pending hop may or may not be counted, depending on whether
+    /// the extend operation finishes before this call is done.
+    fn n_hops(&self) -> usize {
+        let mutable = self.0.lock().expect("poisoned lock");
+        mutable.path.n_hops()
+    }
+}
+
+/// The shared state of a circuit.
+#[derive(Educe, Default)]
+#[educe(Debug)]
+pub(super) struct CircuitState {
     /// Information about this circuit's path.
     ///
     /// This is stored in an Arc so that we can cheaply give a copy of it to
     /// client code; when we need to add a hop (which is less frequent) we use
     /// [`Arc::make_mut()`].
-    pub(super) path: Arc<path::Path>,
+    path: Arc<path::Path>,
 
     /// Circuit binding keys [q.v.][`CircuitBinding`] information for each hop
     /// in the circuit's path.
@@ -199,12 +375,12 @@ pub(super) struct MutableState {
     /// code to assume that a `CircuitBinding` _must_ exist, so I'm making this
     /// an `Option`.
     #[educe(Debug(ignore))]
-    pub(super) binding: Vec<Option<CircuitBinding>>,
+    binding: Vec<Option<CircuitBinding>>,
 }
 
 /// A ClientCirc that needs to send a create cell and receive a created* cell.
 ///
-/// To use one of these, call create_firsthop_fast() or create_firsthop_ntor()
+/// To use one of these, call `create_firsthop_fast()` or `create_firsthop()`
 /// to negotiate the cryptographic handshake with the first hop.
 pub struct PendingClientCirc {
     /// A oneshot receiver on which we'll receive a CREATED* cell,
@@ -215,6 +391,16 @@ pub struct PendingClientCirc {
 }
 
 /// Description of the network's current rules for building circuits.
+///
+/// This type describes rules derived from the consensus,
+/// and possibly amended by our own configuration.
+///
+/// Typically, this type created once for an entire circuit,
+/// and any special per-hop information is derived
+/// from each hop as a CircTarget.
+/// Note however that callers _may_ provide different `CircParameters`
+/// for different hops within a circuit if they have some reason to do so,
+/// so we do not enforce that every hop in a circuit has the same `CircParameters`.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct CircParameters {
@@ -223,6 +409,102 @@ pub struct CircParameters {
     pub extend_by_ed25519_id: bool,
     /// Congestion control parameters for this circuit.
     pub ccontrol: CongestionControlParams,
+
+    /// Maximum number of permitted incoming relay cells for each hop.
+    ///
+    /// If we would receive more relay cells than this from a single hop,
+    /// we close the circuit with [`ExcessInboundCells`](Error::ExcessInboundCells).
+    ///
+    /// If this value is None, then there is no limit to the number of inbound cells.
+    ///
+    /// Known limitation: If this value if `u32::MAX`,
+    /// then a limit of `u32::MAX - 1` is enforced.
+    pub n_incoming_cells_permitted: Option<u32>,
+
+    /// Maximum number of permitted outgoing relay cells for each hop.
+    ///
+    /// If we would try to send more relay cells than this from a single hop,
+    /// we close the circuit with [`ExcessOutboundCells`](Error::ExcessOutboundCells).
+    /// It is the circuit-user's responsibility to make sure that this does not happen.
+    ///
+    /// This setting is used to ensure that we do not violate a limit
+    /// imposed by `n_incoming_cells_permitted`
+    /// on the other side of a circuit.
+    ///
+    /// If this value is None, then there is no limit to the number of outbound cells.
+    ///
+    /// Known limitation: If this value if `u32::MAX`,
+    /// then a limit of `u32::MAX - 1` is enforced.
+    pub n_outgoing_cells_permitted: Option<u32>,
+}
+
+/// The settings we use for single hop of a circuit.
+///
+/// Unlike [`CircParameters`], this type is crate-internal.
+/// We construct it based on our settings from the circuit,
+/// and from the hop's actual capabilities.
+/// Then, we negotiate with the hop as part of circuit
+/// creation/extension to determine the actual settings that will be in use.
+/// Finally, we use those settings to construct the negotiated circuit hop.
+//
+// TODO: Relays should probably derive an instance of this type too, as
+// part of the circuit creation handshake.
+#[derive(Clone, Debug)]
+pub(super) struct HopSettings {
+    /// The negotiated congestion control settings for this circuit.
+    pub(super) ccontrol: CongestionControlParams,
+
+    /// Maximum number of permitted incoming relay cells for this hop.
+    pub(super) n_incoming_cells_permitted: Option<u32>,
+
+    /// Maximum number of permitted outgoing relay cells for this hop.
+    pub(super) n_outgoing_cells_permitted: Option<u32>,
+}
+
+impl HopSettings {
+    /// Construct a new `HopSettings` based on `params` (a set of circuit parameters)
+    /// and `caps` (a set of protocol capabilities for a circuit target).
+    ///
+    /// The resulting settings will represent what the client would prefer to negotiate
+    /// (determined by `params`),
+    /// as modified by what the target relay is believed to support (represented by `caps`).
+    ///
+    /// This represents the `HopSettings` in a pre-negotiation state:
+    /// the circuit negotiation process will modify it.
+    #[allow(clippy::unnecessary_wraps)] // likely to become fallible in the future.
+    pub(super) fn from_params_and_caps(
+        params: &CircParameters,
+        caps: &tor_protover::Protocols,
+    ) -> Result<Self> {
+        let mut settings = Self {
+            ccontrol: params.ccontrol.clone(),
+            n_incoming_cells_permitted: params.n_incoming_cells_permitted,
+            n_outgoing_cells_permitted: params.n_outgoing_cells_permitted,
+        };
+
+        match settings.ccontrol.alg() {
+            crate::ccparams::Algorithm::FixedWindow(_) => {}
+            crate::ccparams::Algorithm::Vegas(_) => {
+                // If the target doesn't support FLOWCTRL_CC, we can't use Vegas.
+                if !caps.supports_named_subver(named::FLOWCTRL_CC) {
+                    settings.ccontrol.use_fallback_alg();
+                }
+            }
+        }
+
+        Ok(settings)
+    }
+
+    /// Return a new `HopSettings` based on this one,
+    /// representing the settings that we should use
+    /// if circuit negotiation will be impossible.
+    ///
+    /// (Circuit negotiation is impossible when using the legacy ntor protocol,
+    /// and when using CRATE_FAST.  It is currently unsupported with virtual hops.)
+    pub(super) fn without_negotiation(mut self) -> Self {
+        self.ccontrol.use_fallback_alg();
+        self
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +513,8 @@ impl std::default::Default for CircParameters {
         Self {
             extend_by_ed25519_id: true,
             ccontrol: crate::congestion::test_utils::params::build_cc_fixed_params(),
+            n_incoming_cells_permitted: None,
+            n_outgoing_cells_permitted: None,
         }
     }
 }
@@ -241,6 +525,8 @@ impl CircParameters {
         Self {
             extend_by_ed25519_id,
             ccontrol,
+            n_incoming_cells_permitted: None,
+            n_outgoing_cells_permitted: None,
         }
     }
 }
@@ -253,81 +539,71 @@ impl ClientCirc {
     /// Panics if there is no first hop.  (This should be impossible outside of
     /// the tor-proto crate, but within the crate it's possible to have a
     /// circuit with no hops.)
-    pub fn first_hop(&self) -> OwnedChanTarget {
-        let first_hop = self
+    pub fn first_hop(&self) -> Result<OwnedChanTarget> {
+        Ok(self
             .mutable
-            .lock()
-            .expect("poisoned lock")
-            .path
-            .first_hop()
-            .expect("called first_hop on an un-constructed circuit");
-        match first_hop {
-            path::HopDetail::Relay(r) => r,
-            #[cfg(feature = "hs-common")]
-            path::HopDetail::Virtual => {
-                panic!("somehow made a circuit with a virtual first hop.")
-            }
-        }
+            .first_hop(self.unique_id)
+            .map_err(|_| Error::CircuitClosed)?
+            .expect("called first_hop on an un-constructed circuit"))
+    }
+
+    /// Return a description of the last hop of the circuit.
+    ///
+    /// Return None if the last hop is virtual.
+    ///
+    /// See caveats on [`ClientCirc::last_hop_num()`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no last hop.  (This should be impossible outside of
+    /// the tor-proto crate, but within the crate it's possible to have a
+    /// circuit with no hops.)
+    pub fn last_hop_info(&self) -> Result<Option<OwnedChanTarget>> {
+        let path = self.path_ref()?;
+        Ok(path
+            .hops()
+            .last()
+            .expect("Called last_hop an an un-constructed circuit")
+            .as_chan_target()
+            .map(OwnedChanTarget::from_chan_target))
     }
 
     /// Return the [`HopNum`] of the last hop of this circuit.
     ///
     /// Returns an error if there is no last hop.  (This should be impossible outside of the
     /// tor-proto crate, but within the crate it's possible to have a circuit with no hops.)
+    ///
+    /// NOTE: This function will return the [`HopNum`] of the hop
+    /// that is _currently_ the last. If there is an extend operation in progress,
+    /// the currently pending hop may or may not be counted, depending on whether
+    /// the extend operation finishes before this call is done.
     pub fn last_hop_num(&self) -> Result<HopNum> {
         Ok(self
             .mutable
-            .lock()
-            .expect("poisoned lock")
-            .path
-            .last_hop_num()
+            .last_hop_num(self.unique_id)?
             .ok_or_else(|| internal!("no last hop index"))?)
     }
 
-    /// Return a description of all the hops in this circuit.
+    /// Return a [`TargetHop`] representing precisely the last hop of the circuit as in set as a
+    /// HopLocation with its id and hop number.
     ///
-    /// This method is **deprecated** for several reasons:
-    ///   * It performs a deep copy.
-    ///   * It ignores virtual hops.
-    ///   * It's not so extensible.
-    ///
-    /// Use [`ClientCirc::path_ref()`] instead.
-    #[deprecated(since = "0.11.1", note = "Use path_ref() instead.")]
-    pub fn path(&self) -> Vec<OwnedChanTarget> {
-        #[allow(clippy::unnecessary_filter_map)] // clippy is blind to the cfg
-        self.mutable
-            .lock()
-            .expect("poisoned lock")
-            .path
-            .all_hops()
-            .into_iter()
-            .filter_map(|hop| match hop {
-                path::HopDetail::Relay(r) => Some(r),
-                #[cfg(feature = "hs-common")]
-                path::HopDetail::Virtual => None,
-            })
-            .collect()
+    /// Return an error if there is no last hop.
+    pub fn last_hop(&self) -> Result<TargetHop> {
+        let hop_num = self
+            .mutable
+            .last_hop_num(self.unique_id)?
+            .ok_or_else(|| bad_api_usage!("no last hop"))?;
+        Ok((self.unique_id, hop_num).into())
     }
 
     /// Return a [`Path`] object describing all the hops in this circuit.
     ///
     /// Note that this `Path` is not automatically updated if the circuit is
     /// extended.
-    pub fn path_ref(&self) -> Arc<Path> {
-        self.mutable.lock().expect("poisoned_lock").path.clone()
-    }
-
-    /// Get the [`LegId`] and [`Path`] of each leg of the tunnel.
-    // TODO(conflux): We probably want to replace uses of `path_ref` with
-    // this method and remove `path_ref`.
-    async fn legs(&self) -> Result<Vec<(LegId, Arc<Path>)>> {
-        let (tx, rx) = oneshot::channel();
-
-        self.command
-            .unbounded_send(CtrlCmd::QueryLegs { done: tx })
-            .map_err(|_| Error::CircuitClosed)?;
-
-        rx.await.map_err(|_| Error::CircuitClosed)?
+    pub fn path_ref(&self) -> Result<Arc<Path>> {
+        self.mutable
+            .path_ref(self.unique_id)
+            .map_err(|_| Error::CircuitClosed)
     }
 
     /// Get the clock skew claimed by the first hop of the circuit.
@@ -355,16 +631,15 @@ impl ClientCirc {
     ///
     /// Return None if we have no circuit binding information for the hop, or if
     /// the hop does not exist.
-    pub fn binding_key(&self, hop: HopNum) -> Option<CircuitBinding> {
-        self.mutable
-            .lock()
-            .expect("poisoned lock")
-            .binding
-            .get::<usize>(hop.into())
-            .cloned()
-            .flatten()
-        // NOTE: I'm not thrilled to have to copy this information, but we use
-        // it very rarely, so it's not _that_ bad IMO.
+    #[cfg(feature = "hs-service")]
+    pub async fn binding_key(&self, hop: TargetHop) -> Result<Option<CircuitBinding>> {
+        let (sender, receiver) = oneshot::channel();
+        let msg = CtrlCmd::GetBindingKey { hop, done: sender };
+        self.command
+            .unbounded_send(msg)
+            .map_err(|_| Error::CircuitClosed)?;
+
+        receiver.await.map_err(|_| Error::CircuitClosed)?
     }
 
     /// Start an ad-hoc protocol exchange to the specified hop on this circuit
@@ -449,33 +724,19 @@ impl ClientCirc {
         &self,
         msg: Option<tor_cell::relaycell::msg::AnyRelayMsg>,
         reply_handler: impl MsgHandler + Send + 'static,
-        hop_num: HopNum,
+        hop: TargetHop,
     ) -> Result<Conversation<'_>> {
-        let handler = Box::new(UserMsgHandler::new(hop_num, reply_handler));
+        // We need to resolve the TargetHop into a precise HopLocation so our msg handler can match
+        // the right Leg/Hop with inbound cell.
+        let (sender, receiver) = oneshot::channel();
+        self.command
+            .unbounded_send(CtrlCmd::ResolveTargetHop { hop, done: sender })
+            .map_err(|_| Error::CircuitClosed)?;
+        let hop_location = receiver.await.map_err(|_| Error::CircuitClosed)??;
+        let handler = Box::new(UserMsgHandler::new(hop_location, reply_handler));
         let conversation = Conversation(self);
         conversation.send_internal(msg, Some(handler)).await?;
         Ok(conversation)
-    }
-
-    /// Start an ad-hoc protocol exchange to the final hop on this circuit
-    ///
-    /// See the [`ClientCirc::start_conversation`] docs for more information.
-    #[cfg(feature = "send-control-msg")]
-    #[deprecated(since = "0.13.0", note = "Use start_conversation instead.")]
-    pub async fn start_conversation_last_hop(
-        &self,
-        msg: Option<tor_cell::relaycell::msg::AnyRelayMsg>,
-        reply_handler: impl MsgHandler + Send + 'static,
-    ) -> Result<Conversation<'_>> {
-        let last_hop = self
-            .mutable
-            .lock()
-            .expect("poisoned lock")
-            .path
-            .last_hop_num()
-            .ok_or_else(|| internal!("no last hop index"))?;
-
-        self.start_conversation(msg, reply_handler, last_hop).await
     }
 
     /// Send an ad-hoc message to a given hop on the circuit, without expecting
@@ -487,14 +748,10 @@ impl ClientCirc {
     pub async fn send_raw_msg(
         &self,
         msg: tor_cell::relaycell::msg::AnyRelayMsg,
-        hop_num: HopNum,
+        hop: TargetHop,
     ) -> Result<()> {
         let (sender, receiver) = oneshot::channel();
-        let ctrl_msg = CtrlMsg::SendMsg {
-            hop_num,
-            msg,
-            sender,
-        };
+        let ctrl_msg = CtrlMsg::SendMsg { hop, msg, sender };
         self.control
             .unbounded_send(ctrl_msg)
             .map_err(|_| Error::CircuitClosed)?;
@@ -525,7 +782,7 @@ impl ClientCirc {
     pub async fn allow_stream_requests(
         self: &Arc<ClientCirc>,
         allow_commands: &[tor_cell::relaycell::RelayCmd],
-        hop_num: HopNum,
+        hop: TargetHop,
         filter: impl crate::stream::IncomingStreamRequestFilter,
     ) -> Result<impl futures::Stream<Item = IncomingStream>> {
         use futures::stream::StreamExt;
@@ -533,18 +790,13 @@ impl ClientCirc {
         /// The size of the channel receiving IncomingStreamRequestContexts.
         const INCOMING_BUFFER: usize = STREAM_READER_BUFFER;
 
-        // TODO(conflux): Support tunnels with more than one leg. This requires a different approach
-        // to `CellHandlers`, as they can't be shared between the tunnel reactor and the circuits.
-        let legs = self.legs().await?;
-        if legs.len() != 1 {
-            return Err(internal!(
-                "Cannot allow stream requests on tunnel with {} legs",
-                legs.len()
-            )
-            .into());
+        // TODO(#2002): support onion service conflux
+        let circ_count = self.mutable.n_legs();
+        if circ_count != 1 {
+            return Err(
+                internal!("Cannot allow stream requests on tunnel with {circ_count} legs",).into(),
+            );
         }
-        let (leg_id, _path) = &legs[0];
-        let leg_id = *leg_id;
 
         let time_prov = self.time_provider.clone();
         let cmd_checker = IncomingCmdChecker::new_any(allow_commands);
@@ -556,7 +808,7 @@ impl ClientCirc {
             .unbounded_send(CtrlCmd::AwaitStreamRequest {
                 cmd_checker,
                 incoming_sender,
-                hop_num,
+                hop,
                 done: tx,
                 filter: Box::new(filter),
             })
@@ -565,16 +817,21 @@ impl ClientCirc {
         // Check whether the AwaitStreamRequest was processed successfully.
         rx.await.map_err(|_| Error::CircuitClosed)??;
 
-        let allowed_hop_num = hop_num;
+        let allowed_hop_loc = match hop {
+            TargetHop::Hop(loc) => Some(loc),
+            _ => None,
+        }
+        .ok_or_else(|| bad_api_usage!("Expected TargetHop with HopLocation"))?;
 
         let circ = Arc::clone(self);
         Ok(incoming_receiver.map(move |req_ctx| {
             let StreamReqInfo {
                 req,
                 stream_id,
-                hop_num,
+                hop,
                 receiver,
                 msg_tx,
+                rate_limit_stream,
                 memquota,
                 relay_cell_format,
             } = req_ctx;
@@ -583,25 +840,59 @@ impl ClientCirc {
             // assertion is just here to make sure that we don't ever
             // accidentally remove or fail to enforce that check, since it is
             // security-critical.
-            assert_eq!(allowed_hop_num, hop_num);
+            assert_eq!(allowed_hop_loc, hop);
 
+            // TODO(#2002): figure out what this is going to look like
+            // for onion services (perhaps we should forbid this function
+            // from being called on a multipath circuit?)
+            //
+            // See also:
+            // https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3002#note_3200937
             let target = StreamTarget {
                 circ: Arc::clone(&circ),
                 tx: msg_tx,
-                hop: HopLocation::Hop((leg_id, hop_num)),
+                hop: allowed_hop_loc,
                 stream_id,
                 relay_cell_format,
+                rate_limit_stream,
             };
 
-            let reader = StreamReader {
+            let reader = StreamReceiver {
                 target: target.clone(),
                 receiver,
                 recv_window: StreamRecvWindow::new(RECV_WINDOW_INIT),
                 ended: false,
             };
 
-            IncomingStream::new(req, target, reader, memquota)
+            IncomingStream::new(circ.time_provider.clone(), req, target, reader, memquota)
         }))
+    }
+
+    /// Extend the circuit, via the most appropriate circuit extension handshake,
+    /// to the chosen `target` hop.
+    pub async fn extend<Tg>(&self, target: &Tg, params: CircParameters) -> Result<()>
+    where
+        Tg: CircTarget,
+    {
+        // For now we use the simplest decision-making mechanism:
+        // we use ntor_v3 whenever it is present; and otherwise we use ntor.
+        //
+        // This behavior is slightly different from C tor, which uses ntor v3
+        // only whenever it want to send any extension in the circuit message.
+        // But thanks to congestion control (named::FLOWCTRL_CC), we'll _always_
+        // want to use an extension if we can, and so it doesn't make too much
+        // sense to detect the case where we have no extensions.
+        //
+        // (As of April 2025, RELAY_NTORV3 is not yet listed as Required for relays
+        // on the tor network, and so we cannot simply assume that everybody has it.)
+        if target
+            .protovers()
+            .supports_named_subver(named::RELAY_NTORV3)
+        {
+            self.extend_ntor_v3(target, params).await
+        } else {
+            self.extend_ntor(target, params).await
+        }
     }
 
     /// Extend the circuit via the ntor handshake to a new target last
@@ -626,12 +917,14 @@ impl ClientCirc {
         let (tx, rx) = oneshot::channel();
 
         let peer_id = OwnedChanTarget::from_chan_target(target);
+        let settings =
+            HopSettings::from_params_and_caps(&params, target.protovers())?.without_negotiation();
         self.control
             .unbounded_send(CtrlMsg::ExtendNtor {
                 peer_id,
                 public_key: key,
                 linkspecs,
-                params,
+                settings,
                 done: tx,
             })
             .map_err(|_| Error::CircuitClosed)?;
@@ -663,12 +956,13 @@ impl ClientCirc {
         let (tx, rx) = oneshot::channel();
 
         let peer_id = OwnedChanTarget::from_chan_target(target);
+        let settings = HopSettings::from_params_and_caps(&params, target.protovers())?;
         self.control
             .unbounded_send(CtrlMsg::ExtendNtorV3 {
                 peer_id,
                 public_key: key,
                 linkspecs,
-                params,
+                settings,
                 done: tx,
             })
             .map_err(|_| Error::CircuitClosed)?;
@@ -701,28 +995,31 @@ impl ClientCirc {
     // TODO hs: let's try to enforce the "you can't extend a circuit again once
     // it has been extended this way" property.  We could do that with internal
     // state, or some kind of a type state pattern.
-    //
-    // TODO hs: possibly we should take a set of Protovers, and not just `Params`.
     #[cfg(feature = "hs-common")]
     pub async fn extend_virtual(
         &self,
         protocol: handshake::RelayProtocol,
         role: handshake::HandshakeRole,
         seed: impl handshake::KeyGenerator,
-        params: CircParameters,
+        params: &CircParameters,
+        capabilities: &tor_protover::Protocols,
     ) -> Result<()> {
         use self::handshake::BoxedClientLayer;
 
         let protocol = handshake::RelayCryptLayerProtocol::from(protocol);
         let relay_cell_format = protocol.relay_cell_format();
 
-        let BoxedClientLayer { fwd, back, binding } = protocol.construct_layers(role, seed)?;
+        let BoxedClientLayer { fwd, back, binding } =
+            protocol.construct_client_layers(role, seed)?;
 
+        let settings = HopSettings::from_params_and_caps(params, capabilities)?
+            // TODO #2037: We _should_ support negotiation here; see #2037.
+            .without_negotiation();
         let (tx, rx) = oneshot::channel();
         let message = CtrlCmd::ExtendVirtual {
             relay_cell_format,
             cell_crypto: (fwd, back, binding),
-            params,
+            settings,
             done: tx,
         };
 
@@ -744,7 +1041,7 @@ impl ClientCirc {
         self: &Arc<ClientCirc>,
         begin_msg: AnyRelayMsg,
         cmd_checker: AnyCmdChecker,
-    ) -> Result<(StreamReader, StreamTarget, StreamAccount)> {
+    ) -> Result<(StreamReceiver, StreamTarget, StreamAccount)> {
         // TODO: Possibly this should take a hop, rather than just
         // assuming it's the last hop.
         let hop = TargetHop::LastHop;
@@ -758,12 +1055,15 @@ impl ClientCirc {
         let (msg_tx, msg_rx) =
             MpscSpec::new(CIRCUIT_BUFFER_SIZE).new_mq(time_prov, memquota.as_raw_account())?;
 
+        let (rate_limit_tx, rate_limit_rx) = watch::channel_with(StreamRateLimit::MAX);
+
         self.control
             .unbounded_send(CtrlMsg::BeginStream {
                 hop,
                 message: begin_msg,
                 sender,
                 rx: msg_rx,
+                rate_limit_notifier: rate_limit_tx,
                 done: tx,
                 cmd_checker,
             })
@@ -777,16 +1077,17 @@ impl ClientCirc {
             hop,
             stream_id,
             relay_cell_format,
+            rate_limit_stream: rate_limit_rx,
         };
 
-        let reader = StreamReader {
+        let stream_receiver = StreamReceiver {
             target: target.clone(),
             receiver,
             recv_window: StreamRecvWindow::new(RECV_WINDOW_INIT),
             ended: false,
         };
 
-        Ok((reader, target, memquota))
+        Ok((stream_receiver, target, memquota))
     }
 
     /// Start a DataStream (anonymized connection) to the given
@@ -796,10 +1097,15 @@ impl ClientCirc {
         msg: AnyRelayMsg,
         optimistic: bool,
     ) -> Result<DataStream> {
-        let (reader, target, memquota) = self
+        let (stream_receiver, target, memquota) = self
             .begin_stream_impl(msg, DataCmdChecker::new_any())
             .await?;
-        let mut stream = DataStream::new(reader, target, memquota);
+        let mut stream = DataStream::new(
+            self.time_provider.clone(),
+            stream_receiver,
+            target,
+            memquota,
+        );
         if !optimistic {
             stream.wait_for_connection().await?;
         }
@@ -889,10 +1195,10 @@ impl ClientCirc {
     /// Helper: Send the resolve message, and read resolved message from
     /// resolve stream.
     async fn try_resolve(self: &Arc<ClientCirc>, msg: Resolve) -> Result<Resolved> {
-        let (reader, _target, memquota) = self
+        let (stream_receiver, _target, memquota) = self
             .begin_stream_impl(msg.into(), ResolveCmdChecker::new_any())
             .await?;
-        let mut resolve_stream = ResolveStream::new(reader, memquota);
+        let mut resolve_stream = ResolveStream::new(stream_receiver, memquota);
         resolve_stream.read_msg().await
     }
 
@@ -937,8 +1243,10 @@ impl ClientCirc {
     /// _currently_ in the circuit. If there is an extend operation in progress,
     /// the currently pending hop may or may not be counted, depending on whether
     /// the extend operation finishes before this call is done.
-    pub fn n_hops(&self) -> usize {
-        self.mutable.lock().expect("poisoned lock").path.n_hops()
+    pub fn n_hops(&self) -> Result<usize> {
+        self.mutable
+            .n_hops(self.unique_id)
+            .map_err(|_| Error::CircuitClosed)
     }
 
     /// Return a future that will resolve once this circuit has closed.
@@ -1012,11 +1320,12 @@ impl PendingClientCirc {
         createdreceiver: oneshot::Receiver<CreateResponse>,
         input: CircuitRxReceiver,
         unique_id: UniqId,
+        runtime: DynTimeProvider,
         memquota: CircuitAccount,
     ) -> (PendingClientCirc, crate::tunnel::reactor::Reactor) {
         let time_provider = channel.time_provider().clone();
         let (reactor, control_tx, command_tx, reactor_closed_rx, mutable) =
-            Reactor::new(channel, id, unique_id, input, memquota.clone());
+            Reactor::new(channel, id, unique_id, input, runtime, memquota.clone());
 
         let circuit = ClientCirc {
             mutable,
@@ -1049,13 +1358,20 @@ impl PendingClientCirc {
     /// so we don't need to know whom we're connecting to: we're just
     /// connecting to whichever relay the channel is for.
     pub async fn create_firsthop_fast(self, params: CircParameters) -> Result<Arc<ClientCirc>> {
+        // We no nothing about this relay, so we assume it supports no protocol capabilities at all.
+        //
+        // TODO: If we had a consensus, we could assume it supported all required-relay-protocols.
+        let protocols = tor_protover::Protocols::new();
+        let settings =
+            HopSettings::from_params_and_caps(&params, &protocols)?.without_negotiation();
+
         let (tx, rx) = oneshot::channel();
         self.circ
             .control
             .unbounded_send(CtrlMsg::Create {
                 recv_created: self.recvcreated,
                 handshake: CircuitHandshake::CreateFast,
-                params,
+                settings,
                 done: tx,
             })
             .map_err(|_| Error::CircuitClosed)?;
@@ -1063,6 +1379,29 @@ impl PendingClientCirc {
         rx.await.map_err(|_| Error::CircuitClosed)??;
 
         Ok(self.circ)
+    }
+
+    /// Use the most appropriate handshake to connect to the first hop of this circuit.
+    ///
+    /// Note that the provided 'target' must match the channel's target,
+    /// or the handshake will fail.
+    pub async fn create_firsthop<Tg>(
+        self,
+        target: &Tg,
+        params: CircParameters,
+    ) -> Result<Arc<ClientCirc>>
+    where
+        Tg: tor_linkspec::CircTarget,
+    {
+        // (See note in ClientCirc::extend.)
+        if target
+            .protovers()
+            .supports_named_subver(named::RELAY_NTORV3)
+        {
+            self.create_firsthop_ntor_v3(target, params).await
+        } else {
+            self.create_firsthop_ntor(target, params).await
+        }
     }
 
     /// Use the ntor handshake to connect to the first hop of this circuit.
@@ -1078,6 +1417,8 @@ impl PendingClientCirc {
         Tg: tor_linkspec::CircTarget,
     {
         let (tx, rx) = oneshot::channel();
+        let settings =
+            HopSettings::from_params_and_caps(&params, target.protovers())?.without_negotiation();
 
         self.circ
             .control
@@ -1094,7 +1435,7 @@ impl PendingClientCirc {
                         .ed_identity()
                         .ok_or(Error::MissingId(RelayIdType::Ed25519))?,
                 },
-                params,
+                settings,
                 done: tx,
             })
             .map_err(|_| Error::CircuitClosed)?;
@@ -1120,6 +1461,7 @@ impl PendingClientCirc {
     where
         Tg: tor_linkspec::CircTarget,
     {
+        let settings = HopSettings::from_params_and_caps(&params, target.protovers())?;
         let (tx, rx) = oneshot::channel();
 
         self.circ
@@ -1134,7 +1476,7 @@ impl PendingClientCirc {
                         pk: *target.ntor_onion_key(),
                     },
                 },
-                params,
+                settings,
                 done: tx,
             })
             .map_err(|_| Error::CircuitClosed)?;
@@ -1175,7 +1517,6 @@ pub(crate) mod test {
     use super::*;
     use crate::channel::OpenChanCellS2C;
     use crate::channel::{test::new_reactor, CodecError};
-    use crate::congestion::sendme;
     use crate::congestion::test_utils::params::build_cc_vegas_params;
     use crate::crypto::cell::RelayCellBody;
     use crate::crypto::handshake::ntor_v3::NtorV3Server;
@@ -1192,8 +1533,9 @@ pub(crate) mod test {
     use std::fmt::Debug;
     use std::time::Duration;
     use tor_basic_utils::test_rng::testing_rng;
-    use tor_cell::chancell::{msg as chanmsg, AnyChanCell, BoxedCellBody, ChanCmd};
-    use tor_cell::relaycell::extend::NtorV3Extension;
+    use tor_cell::chancell::{msg as chanmsg, AnyChanCell, BoxedCellBody, ChanCell, ChanCmd};
+    use tor_cell::relaycell::extend::{self as extend_ext, CircRequestExt, CircResponseExt};
+    use tor_cell::relaycell::msg::SendmeTag;
     use tor_cell::relaycell::{
         msg as relaymsg, AnyRelayMsgOuter, RelayCellFormat, RelayCmd, RelayMsg as _, StreamId,
     };
@@ -1202,6 +1544,17 @@ pub(crate) mod test {
     use tor_rtcompat::Runtime;
     use tracing::trace;
     use tracing_test::traced_test;
+
+    #[cfg(feature = "conflux")]
+    use {
+        crate::tunnel::reactor::ConfluxHandshakeResult,
+        crate::util::err::ConfluxHandshakeError,
+        futures::lock::Mutex as AsyncMutex,
+        std::result::Result as StdResult,
+        tor_cell::relaycell::conflux::{V1DesiredUx, V1LinkPayload, V1Nonce},
+        tor_cell::relaycell::msg::ConfluxLink,
+        tor_rtmock::MockRuntime,
+    };
 
     impl PendingClientCirc {
         /// Testing only: Extract the circuit ID for this pending circuit.
@@ -1252,7 +1605,7 @@ pub(crate) mod test {
             .rsa_identity(EXAMPLE_RSA_ID.into());
         builder
             .ntor_onion_key(EXAMPLE_PK.into())
-            .protocols("FlowCtrl=1".parse().unwrap())
+            .protocols("FlowCtrl=1-2".parse().unwrap())
             .build()
             .unwrap()
     }
@@ -1312,6 +1665,7 @@ pub(crate) mod test {
             created_recv,
             circmsg_recv,
             unique_id,
+            DynTimeProvider::new(rt.clone()),
             CircuitAccount::new_noop(),
         );
 
@@ -1360,16 +1714,16 @@ pub(crate) mod test {
                         other => panic!("{:?}", other),
                     };
                     let mut reply_fn = if with_cc {
-                        |client_exts: &[NtorV3Extension]| {
+                        |client_exts: &[CircRequestExt]| {
                             let _ = client_exts
                                 .iter()
-                                .find(|e| matches!(e, NtorV3Extension::RequestCongestionControl))
+                                .find(|e| matches!(e, CircRequestExt::CcRequest(_)))
                                 .expect("Client failed to request CC");
-                            Some(vec![NtorV3Extension::AckCongestionControl {
-                                // This needs to be aligned to test_utils params
-                                // value due to validation that needs it in range.
-                                sendme_inc: 31,
-                            }])
+                            // This needs to be aligned to test_utils params
+                            // value due to validation that needs it in range.
+                            Some(vec![CircResponseExt::CcResponse(
+                                extend_ext::CcResponse::new(31),
+                            )])
                         }
                     } else {
                         |_: &_| Some(vec![])
@@ -1419,7 +1773,7 @@ pub(crate) mod test {
         let _circ = circ.unwrap();
 
         // pfew!  We've build a circuit!  Let's make sure it has one hop.
-        assert_eq!(_circ.n_hops(), 1);
+        assert_eq!(_circ.n_hops().unwrap(), 1);
     }
 
     #[traced_test]
@@ -1460,25 +1814,29 @@ pub(crate) mod test {
         lasthop: bool,
     }
     impl DummyCrypto {
-        fn next_tag(&mut self) -> &[u8; 20] {
+        fn next_tag(&mut self) -> SendmeTag {
             #![allow(clippy::identity_op)]
             self.counter_tag[0] = ((self.counter >> 0) & 255) as u8;
             self.counter_tag[1] = ((self.counter >> 8) & 255) as u8;
             self.counter_tag[2] = ((self.counter >> 16) & 255) as u8;
             self.counter_tag[3] = ((self.counter >> 24) & 255) as u8;
             self.counter += 1;
-            &self.counter_tag
+            self.counter_tag.into()
         }
     }
 
     impl crate::crypto::cell::OutboundClientLayer for DummyCrypto {
-        fn originate_for(&mut self, _cmd: ChanCmd, _cell: &mut RelayCellBody) -> &[u8] {
+        fn originate_for(&mut self, _cmd: ChanCmd, _cell: &mut RelayCellBody) -> SendmeTag {
             self.next_tag()
         }
         fn encrypt_outbound(&mut self, _cmd: ChanCmd, _cell: &mut RelayCellBody) {}
     }
     impl crate::crypto::cell::InboundClientLayer for DummyCrypto {
-        fn decrypt_inbound(&mut self, _cmd: ChanCmd, _cell: &mut RelayCellBody) -> Option<&[u8]> {
+        fn decrypt_inbound(
+            &mut self,
+            _cmd: ChanCmd,
+            _cell: &mut RelayCellBody,
+        ) -> Option<SendmeTag> {
             if self.lasthop {
                 Some(self.next_tag())
             } else {
@@ -1500,13 +1858,15 @@ pub(crate) mod test {
     // next inbound message seems to come from hop next_msg_from
     async fn newcirc_ext<R: Runtime>(
         rt: &R,
+        unique_id: UniqId,
         chan: Arc<Channel>,
+        hops: Vec<path::HopDetail>,
         next_msg_from: HopNum,
+        params: CircParameters,
     ) -> (Arc<ClientCirc>, CircuitRxSender) {
         let circid = CircId::new(128).unwrap();
         let (_created_send, created_recv) = oneshot::channel();
         let (circmsg_send, circmsg_recv) = fake_mpsc(64);
-        let unique_id = UniqId::new(23, 17);
 
         let (pending, reactor) = PendingClientCirc::new(
             circid,
@@ -1514,6 +1874,7 @@ pub(crate) mod test {
             created_recv,
             circmsg_recv,
             unique_id,
+            DynTimeProvider::new(rt.clone()),
             CircuitAccount::new_noop(),
         );
 
@@ -1529,15 +1890,19 @@ pub(crate) mod test {
 
         // TODO #1067: Support other formats
         let relay_cell_format = RelayCellFormat::V0;
-        for idx in 0_u8..3 {
-            let params = CircParameters::default();
+
+        let last_hop_num = u8::try_from(hops.len() - 1).unwrap();
+        for (idx, peer_id) in hops.into_iter().enumerate() {
             let (tx, rx) = oneshot::channel();
+            let idx = idx as u8;
+
             circ.command
                 .unbounded_send(CtrlCmd::AddFakeHop {
                     relay_cell_format,
-                    fwd_lasthop: idx == 2,
+                    fwd_lasthop: idx == last_hop_num,
                     rev_lasthop: idx == u8::from(next_msg_from),
-                    params,
+                    peer_id,
+                    params: params.clone(),
                     done: tx,
                 })
                 .unwrap();
@@ -1550,7 +1915,44 @@ pub(crate) mod test {
     // Helper: set up a 3-hop circuit with no encryption, where the
     // next inbound message seems to come from hop next_msg_from
     async fn newcirc<R: Runtime>(rt: &R, chan: Arc<Channel>) -> (Arc<ClientCirc>, CircuitRxSender) {
-        newcirc_ext(rt, chan, 2.into()).await
+        let hops = std::iter::repeat_with(|| {
+            let peer_id = tor_linkspec::OwnedChanTarget::builder()
+                .ed_identity([4; 32].into())
+                .rsa_identity([5; 20].into())
+                .build()
+                .expect("Could not construct fake hop");
+
+            path::HopDetail::Relay(peer_id)
+        })
+        .take(3)
+        .collect();
+
+        let unique_id = UniqId::new(23, 17);
+        newcirc_ext(
+            rt,
+            unique_id,
+            chan,
+            hops,
+            2.into(),
+            CircParameters::default(),
+        )
+        .await
+    }
+
+    /// Create `n` distinct [`path::HopDetail`]s,
+    /// with the specified `start_idx` for the dummy identities.
+    fn hop_details(n: u8, start_idx: u8) -> Vec<path::HopDetail> {
+        (0..n)
+            .map(|idx| {
+                let peer_id = tor_linkspec::OwnedChanTarget::builder()
+                    .ed_identity([idx + start_idx; 32].into())
+                    .rsa_identity([idx + start_idx + 1; 20].into())
+                    .build()
+                    .expect("Could not construct fake hop");
+
+                path::HopDetail::Relay(peer_id)
+            })
+            .collect()
     }
 
     async fn test_extend<R: Runtime>(rt: &R, handshake_type: HandshakeType) {
@@ -1602,7 +2004,7 @@ pub(crate) mod test {
                 HandshakeType::NtorV3 => {
                     let (_keygen, reply) = NtorV3Server::server(
                         &mut rng,
-                        &mut |_: &[NtorV3Extension]| Some(vec![]),
+                        &mut |_: &[CircRequestExt]| Some(vec![]),
                         &[example_ntor_v3_key()],
                         e2.handshake(),
                     )
@@ -1616,22 +2018,30 @@ pub(crate) mod test {
             (sink, rx) // gotta keep the sink and receiver alive, or the reactor will exit.
         };
 
-        let (circ, _) = futures::join!(extend_fut, reply_fut);
+        let (circ, (_sink, _rx)) = futures::join!(extend_fut, reply_fut);
 
         // Did we really add another hop?
-        assert_eq!(circ.n_hops(), 4);
+        assert_eq!(circ.n_hops().unwrap(), 4);
 
         // Do the path accessors report a reasonable outcome?
-        #[allow(deprecated)]
         {
-            let path = circ.path();
+            let path = circ.path_ref().unwrap();
+            let path = path
+                .all_hops()
+                .filter_map(|hop| match hop {
+                    path::HopDetail::Relay(r) => Some(r),
+                    #[cfg(feature = "hs-common")]
+                    path::HopDetail::Virtual => None,
+                })
+                .collect::<Vec<_>>();
+
             assert_eq!(path.len(), 4);
             use tor_linkspec::HasRelayIds;
             assert_eq!(path[3].ed_identity(), example_target().ed_identity());
             assert_ne!(path[0].ed_identity(), example_target().ed_identity());
         }
         {
-            let path = circ.path_ref();
+            let path = circ.path_ref().unwrap();
             assert_eq!(path.n_hops(), 4);
             use tor_linkspec::HasRelayIds;
             assert_eq!(
@@ -1667,7 +2077,28 @@ pub(crate) mod test {
         bad_reply: ClientCircChanMsg,
     ) -> Error {
         let (chan, _rx, _sink) = working_fake_channel(rt);
-        let (circ, mut sink) = newcirc_ext(rt, chan, reply_hop).await;
+        let hops = std::iter::repeat_with(|| {
+            let peer_id = tor_linkspec::OwnedChanTarget::builder()
+                .ed_identity([4; 32].into())
+                .rsa_identity([5; 20].into())
+                .build()
+                .expect("Could not construct fake hop");
+
+            path::HopDetail::Relay(peer_id)
+        })
+        .take(3)
+        .collect();
+
+        let unique_id = UniqId::new(23, 17);
+        let (circ, mut sink) = newcirc_ext(
+            rt,
+            unique_id,
+            chan,
+            hops,
+            reply_hop,
+            CircParameters::default(),
+        )
+        .await;
         let params = CircParameters::default();
 
         let target = example_target();
@@ -1683,7 +2114,7 @@ pub(crate) mod test {
         let outcome = circ.extend_ntor(&target, params).await;
         let _sink = sink_handle.await;
 
-        assert_eq!(circ.n_hops(), 3);
+        assert_eq!(circ.n_hops().unwrap(), 3);
         assert!(outcome.is_err());
         outcome.unwrap_err()
     }
@@ -1998,6 +2429,7 @@ pub(crate) mod test {
                 circ.command
                     .unbounded_send(CtrlCmd::QuerySendWindow {
                         hop: 2.into(),
+                        leg: circ.unique_id(),
                         done: tx,
                     })
                     .unwrap();
@@ -2007,17 +2439,17 @@ pub(crate) mod test {
                 // 100
                 assert_eq!(
                     tags[0],
-                    sendme::CircTag::from(hex!("6400000000000000000000000000000000000000"))
+                    SendmeTag::from(hex!("6400000000000000000000000000000000000000"))
                 );
                 // 200
                 assert_eq!(
                     tags[1],
-                    sendme::CircTag::from(hex!("c800000000000000000000000000000000000000"))
+                    SendmeTag::from(hex!("c800000000000000000000000000000000000000"))
                 );
                 // 300
                 assert_eq!(
                     tags[2],
-                    sendme::CircTag::from(hex!("2c01000000000000000000000000000000000000"))
+                    SendmeTag::from(hex!("2c01000000000000000000000000000000000000"))
                 );
             }
 
@@ -2046,6 +2478,7 @@ pub(crate) mod test {
                 circ.command
                     .unbounded_send(CtrlCmd::QuerySendWindow {
                         hop: 2.into(),
+                        leg: circ.unique_id(),
                         done: tx,
                     })
                     .unwrap();
@@ -2245,7 +2678,7 @@ pub(crate) mod test {
             let _incoming = circ
                 .allow_stream_requests(
                     &[tor_cell::relaycell::RelayCmd::BEGIN],
-                    circ.last_hop_num().unwrap(),
+                    circ.last_hop().unwrap(),
                     AllowAllStreamsFilter,
                 )
                 .await
@@ -2254,7 +2687,7 @@ pub(crate) mod test {
             let incoming = circ
                 .allow_stream_requests(
                     &[tor_cell::relaycell::RelayCmd::BEGIN],
-                    circ.last_hop_num().unwrap(),
+                    circ.last_hop().unwrap(),
                     AllowAllStreamsFilter,
                 )
                 .await;
@@ -2283,7 +2716,7 @@ pub(crate) mod test {
             let mut incoming = circ
                 .allow_stream_requests(
                     &[tor_cell::relaycell::RelayCmd::BEGIN],
-                    circ.last_hop_num().unwrap(),
+                    circ.last_hop().unwrap(),
                     AllowAllStreamsFilter,
                 )
                 .await
@@ -2362,7 +2795,7 @@ pub(crate) mod test {
             let mut incoming = circ
                 .allow_stream_requests(
                     &[tor_cell::relaycell::RelayCmd::BEGIN],
-                    circ.last_hop_num().unwrap(),
+                    circ.last_hop().unwrap(),
                     AllowAllStreamsFilter,
                 )
                 .await
@@ -2453,7 +2886,7 @@ pub(crate) mod test {
             let mut incoming = circ
                 .allow_stream_requests(
                     &[tor_cell::relaycell::RelayCmd::BEGIN],
-                    EXPECTED_HOP.into(),
+                    (circ.unique_id(), EXPECTED_HOP.into()).into(),
                     AllowAllStreamsFilter,
                 )
                 .await
@@ -2485,4 +2918,999 @@ pub(crate) mod test {
             let (_circ, _send) = futures::join!(simulate_service, simulate_client);
         });
     }
+
+    #[traced_test]
+    #[test]
+    #[cfg(feature = "conflux")]
+    fn multipath_circ_validation() {
+        use std::error::Error as _;
+
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let params = CircParameters::default();
+            let invalid_tunnels = [
+                setup_bad_conflux_tunnel(&rt).await,
+                setup_conflux_tunnel(&rt, true, params).await,
+            ];
+
+            for tunnel in invalid_tunnels {
+                let TestTunnelCtx {
+                    tunnel: _tunnel,
+                    circs: _circs,
+                    conflux_link_rx,
+                } = tunnel;
+
+                let conflux_hs_err = conflux_link_rx.await.unwrap().unwrap_err();
+                let err_src = conflux_hs_err.source().unwrap();
+
+                // The two circuits don't end in the same hop (no join point),
+                // so the reactor will refuse to link them
+                assert!(err_src
+                    .to_string()
+                    .contains("one more more conflux circuits are invalid"));
+            }
+        });
+    }
+
+    // TODO: this structure could be reused for the other tests,
+    // to address nickm's comment:
+    // https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3005#note_3202362
+    #[derive(Debug)]
+    #[allow(unused)]
+    #[cfg(feature = "conflux")]
+    struct TestCircuitCtx {
+        chan_rx: Receiver<AnyChanCell>,
+        chan_tx: Sender<std::result::Result<OpenChanCellS2C, CodecError>>,
+        circ_tx: CircuitRxSender,
+        unique_id: UniqId,
+    }
+
+    #[derive(Debug)]
+    #[cfg(feature = "conflux")]
+    struct TestTunnelCtx {
+        tunnel: Arc<ClientCirc>,
+        circs: Vec<TestCircuitCtx>,
+        conflux_link_rx: oneshot::Receiver<Result<ConfluxHandshakeResult>>,
+    }
+
+    /// Wait for a LINK cell to arrive on the specified channel and return its payload.
+    #[cfg(feature = "conflux")]
+    async fn await_link_payload(rx: &mut Receiver<AnyChanCell>) -> ConfluxLink {
+        // Wait for the LINK cell...
+        let (_id, chmsg) = rx.next().await.unwrap().into_circid_and_msg();
+        let rmsg = match chmsg {
+            AnyChanMsg::Relay(r) => {
+                AnyRelayMsgOuter::decode_singleton(RelayCellFormat::V0, r.into_relay_body())
+                    .unwrap()
+            }
+            other => panic!("{:?}", other),
+        };
+        let (streamid, rmsg) = rmsg.into_streamid_and_msg();
+
+        let link = match rmsg {
+            AnyRelayMsg::ConfluxLink(link) => link,
+            _ => panic!("unexpected relay message {rmsg:?}"),
+        };
+
+        assert!(streamid.is_none());
+
+        link
+    }
+
+    #[cfg(feature = "conflux")]
+    async fn setup_conflux_tunnel(
+        rt: &MockRuntime,
+        same_hops: bool,
+        params: CircParameters,
+    ) -> TestTunnelCtx {
+        let hops1 = hop_details(3, 0);
+        let hops2 = if same_hops {
+            hops1.clone()
+        } else {
+            hop_details(3, 10)
+        };
+
+        let (chan1, rx1, chan_sink1) = working_fake_channel(rt);
+        let (circ1, sink1) = newcirc_ext(
+            rt,
+            UniqId::new(1, 3),
+            chan1,
+            hops1,
+            2.into(),
+            params.clone(),
+        )
+        .await;
+
+        let (chan2, rx2, chan_sink2) = working_fake_channel(rt);
+
+        let (circ2, sink2) =
+            newcirc_ext(rt, UniqId::new(2, 4), chan2, hops2, 2.into(), params).await;
+
+        let (answer_tx, answer_rx) = oneshot::channel();
+        circ2
+            .command
+            .unbounded_send(CtrlCmd::ShutdownAndReturnCircuit { answer: answer_tx })
+            .unwrap();
+
+        let circuit = answer_rx.await.unwrap().unwrap();
+        // The circuit should be shutting down its reactor
+        rt.advance_until_stalled().await;
+        assert!(circ2.is_closing());
+
+        let (conflux_link_tx, conflux_link_rx) = oneshot::channel();
+        // Tell the first circuit to link with the second and form a multipath tunnel
+        circ1
+            .control
+            .unbounded_send(CtrlMsg::LinkCircuits {
+                circuits: vec![circuit],
+                answer: conflux_link_tx,
+            })
+            .unwrap();
+
+        let circ_ctx1 = TestCircuitCtx {
+            chan_rx: rx1,
+            chan_tx: chan_sink1,
+            circ_tx: sink1,
+            unique_id: circ1.unique_id(),
+        };
+
+        let circ_ctx2 = TestCircuitCtx {
+            chan_rx: rx2,
+            chan_tx: chan_sink2,
+            circ_tx: sink2,
+            unique_id: circ2.unique_id(),
+        };
+
+        TestTunnelCtx {
+            tunnel: circ1,
+            circs: vec![circ_ctx1, circ_ctx2],
+            conflux_link_rx,
+        }
+    }
+
+    #[cfg(feature = "conflux")]
+    async fn setup_good_conflux_tunnel(rt: &MockRuntime) -> TestTunnelCtx {
+        // Our 2 test circuits are identical, so they both have the same guards,
+        // which technically violates the conflux set rule mentioned in prop354.
+        // For testing purposes this is fine, but in production we'll need to ensure
+        // the calling code prevents guard reuse (except in the case where
+        // one of the guards happens to be Guard + Exit)
+        let same_hops = true;
+        let params = CircParameters::new(true, build_cc_vegas_params());
+        setup_conflux_tunnel(rt, same_hops, params).await
+    }
+
+    #[cfg(feature = "conflux")]
+    async fn setup_bad_conflux_tunnel(rt: &MockRuntime) -> TestTunnelCtx {
+        // The two circuits don't share any hops,
+        // so they won't end in the same hop (no join point),
+        // causing the reactor to refuse to link them.
+        let same_hops = false;
+        let params = CircParameters::new(true, build_cc_vegas_params());
+        setup_conflux_tunnel(rt, same_hops, params).await
+    }
+
+    #[traced_test]
+    #[test]
+    #[cfg(feature = "conflux")]
+    fn reject_conflux_linked_before_hs() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let (chan, mut _rx, _sink) = working_fake_channel(&rt);
+            let (circ, mut sink) = newcirc(&rt, chan).await;
+
+            let nonce = V1Nonce::new(&mut testing_rng());
+            let payload = V1LinkPayload::new(nonce, V1DesiredUx::NO_OPINION);
+            // Send a LINKED cell
+            let linked = relaymsg::ConfluxLinked::new(payload).into();
+            sink.send(rmsg_to_ccmsg(None, linked)).await.unwrap();
+
+            rt.advance_until_stalled().await;
+            assert!(circ.is_closing());
+        });
+    }
+
+    #[traced_test]
+    #[test]
+    #[cfg(feature = "conflux")]
+    fn conflux_hs_timeout() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let TestTunnelCtx {
+                tunnel: _tunnel,
+                circs,
+                conflux_link_rx,
+            } = setup_good_conflux_tunnel(&rt).await;
+
+            let [mut circ1, _circ2]: [TestCircuitCtx; 2] = circs.try_into().unwrap();
+
+            // Wait for the LINK cell
+            let link = await_link_payload(&mut circ1.chan_rx).await;
+
+            // Send a LINK cell on the first leg...
+            let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
+            circ1
+                .circ_tx
+                .send(rmsg_to_ccmsg(None, linked))
+                .await
+                .unwrap();
+
+            // Do nothing, and wait for the handshake to timeout on the second leg
+            rt.advance_by(Duration::from_secs(60)).await;
+
+            let conflux_hs_res = conflux_link_rx.await.unwrap().unwrap();
+
+            // Get the handshake results of each circuit
+            let [res1, res2]: [StdResult<(), ConfluxHandshakeError>; 2] =
+                conflux_hs_res.try_into().unwrap();
+
+            assert!(res1.is_ok());
+
+            let err = res2.unwrap_err();
+            assert!(matches!(err, ConfluxHandshakeError::Timeout), "{err:?}");
+        });
+    }
+
+    #[traced_test]
+    #[test]
+    #[cfg(feature = "conflux")]
+    fn conflux_bad_hs() {
+        use crate::util::err::ConfluxHandshakeError;
+
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let nonce = V1Nonce::new(&mut testing_rng());
+            let bad_link_payload = V1LinkPayload::new(nonce, V1DesiredUx::NO_OPINION);
+            //let extended2 = relaymsg::Extended2::new(vec![]).into();
+            let bad_hs_responses = [
+                (
+                    rmsg_to_ccmsg(
+                        None,
+                        relaymsg::ConfluxLinked::new(bad_link_payload.clone()).into(),
+                    ),
+                    "Received CONFLUX_LINKED cell with mismatched nonce",
+                ),
+                (
+                    rmsg_to_ccmsg(None, relaymsg::ConfluxLink::new(bad_link_payload).into()),
+                    "Unexpected CONFLUX_LINK cell from hop #3 on client circuit",
+                ),
+                (
+                    rmsg_to_ccmsg(None, relaymsg::ConfluxSwitch::new(0).into()),
+                    "Received CONFLUX_SWITCH on unlinked circuit?!",
+                ),
+                // TODO: this currently causes the reactor to shut down immediately,
+                // without sending a response on the handshake channel
+                /*
+                (
+                    rmsg_to_ccmsg(None, extended2),
+                    "Received CONFLUX_LINKED cell with mismatched nonce",
+                ),
+                */
+            ];
+
+            for (bad_cell, expected_err) in bad_hs_responses {
+                let TestTunnelCtx {
+                    tunnel,
+                    circs,
+                    conflux_link_rx,
+                } = setup_good_conflux_tunnel(&rt).await;
+
+                let [mut _circ1, mut circ2]: [TestCircuitCtx; 2] = circs.try_into().unwrap();
+
+                // Respond with a bogus cell on one of the legs
+                circ2.circ_tx.send(bad_cell).await.unwrap();
+
+                let conflux_hs_res = conflux_link_rx.await.unwrap().unwrap();
+                // Get the handshake results (the handshake results are reported early,
+                // without waiting for the second circuit leg's handshake to timeout,
+                // because this is a protocol violation causing the entire tunnel to shut down)
+                let [res2]: [StdResult<(), ConfluxHandshakeError>; 1] =
+                    conflux_hs_res.try_into().unwrap();
+
+                match res2.unwrap_err() {
+                    ConfluxHandshakeError::Link(Error::CircProto(e)) => {
+                        assert_eq!(e, expected_err);
+                    }
+                    e => panic!("unexpected error: {e:?}"),
+                }
+
+                assert!(tunnel.is_closing());
+            }
+        });
+    }
+
+    #[traced_test]
+    #[test]
+    #[cfg(feature = "conflux")]
+    fn unexpected_conflux_cell() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let nonce = V1Nonce::new(&mut testing_rng());
+            let link_payload = V1LinkPayload::new(nonce, V1DesiredUx::NO_OPINION);
+            let bad_cells = [
+                rmsg_to_ccmsg(
+                    None,
+                    relaymsg::ConfluxLinked::new(link_payload.clone()).into(),
+                ),
+                rmsg_to_ccmsg(
+                    None,
+                    relaymsg::ConfluxLink::new(link_payload.clone()).into(),
+                ),
+                rmsg_to_ccmsg(None, relaymsg::ConfluxSwitch::new(0).into()),
+            ];
+
+            for bad_cell in bad_cells {
+                let (chan, mut _rx, _sink) = working_fake_channel(&rt);
+                let (circ, mut sink) = newcirc(&rt, chan).await;
+
+                sink.send(bad_cell).await.unwrap();
+                rt.advance_until_stalled().await;
+
+                // Note: unfortunately we can't assert the circuit is
+                // closing for the reason, because the reactor just logs
+                // the error and then exits.
+                assert!(circ.is_closing());
+            }
+        });
+    }
+
+    #[traced_test]
+    #[test]
+    #[cfg(feature = "conflux")]
+    fn conflux_bad_linked() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let TestTunnelCtx {
+                tunnel,
+                circs,
+                conflux_link_rx: _,
+            } = setup_good_conflux_tunnel(&rt).await;
+
+            let [mut circ1, mut circ2]: [TestCircuitCtx; 2] = circs.try_into().unwrap();
+
+            let link = await_link_payload(&mut circ1.chan_rx).await;
+
+            // Send a LINK cell on the first leg...
+            let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
+            circ1
+                .circ_tx
+                .send(rmsg_to_ccmsg(None, linked))
+                .await
+                .unwrap();
+
+            // ...and two LINKED cells on the second
+            let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
+            circ2
+                .circ_tx
+                .send(rmsg_to_ccmsg(None, linked))
+                .await
+                .unwrap();
+            let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
+            circ2
+                .circ_tx
+                .send(rmsg_to_ccmsg(None, linked))
+                .await
+                .unwrap();
+
+            rt.advance_until_stalled().await;
+
+            // Receiving a LINKED cell on an already linked leg causes
+            // the tunnel to be torn down
+            assert!(tunnel.is_closing());
+        });
+    }
+
+    #[traced_test]
+    #[test]
+    #[cfg(feature = "conflux")]
+    fn conflux_bad_switch() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            let bad_switch = [
+                // SWITCH cells with seqno = 0 are not allowed
+                relaymsg::ConfluxSwitch::new(0),
+                // TODO(#2031): from c-tor:
+                //
+                // We have to make sure that the switch command is truly
+                // incrementing the sequence number, or else it becomes
+                // a side channel that can be spammed for traffic analysis.
+                //
+                // We should figure out what this check is supposed to look like,
+                // and have a test for it
+            ];
+
+            for bad_cell in bad_switch {
+                let TestTunnelCtx {
+                    tunnel,
+                    circs,
+                    conflux_link_rx,
+                } = setup_good_conflux_tunnel(&rt).await;
+
+                let [mut circ1, mut circ2]: [TestCircuitCtx; 2] = circs.try_into().unwrap();
+
+                let link = await_link_payload(&mut circ1.chan_rx).await;
+
+                // Send a LINKED cell on both legs
+                for circ in [&mut circ1, &mut circ2] {
+                    let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
+                    circ.circ_tx
+                        .send(rmsg_to_ccmsg(None, linked))
+                        .await
+                        .unwrap();
+                }
+
+                let conflux_hs_res = conflux_link_rx.await.unwrap().unwrap();
+                assert!(conflux_hs_res.iter().all(|res| res.is_ok()));
+
+                // Now send a bad SWITCH cell on *both* legs.
+                // This will cause both legs to be removed from the conflux set,
+                // which causes the tunnel reactor to shut down
+                for circ in [&mut circ1, &mut circ2] {
+                    let msg = rmsg_to_ccmsg(None, bad_cell.clone().into());
+                    circ.circ_tx.send(msg).await.unwrap();
+                }
+
+                // The tunnel should be shutting down
+                rt.advance_until_stalled().await;
+                assert!(tunnel.is_closing());
+            }
+        });
+    }
+
+    // TODO(conflux): add a test for SWITCH handling
+
+    /// Run a conflux test endpoint.
+    #[cfg(feature = "conflux")]
+    #[derive(Debug)]
+    enum ConfluxTestEndpoint<I: Iterator<Item = Option<Duration>>> {
+        /// Pretend to be an exit relay.
+        Relay(ConfluxExitState<I>),
+        /// Client task.
+        Client {
+            /// Channel for receiving the outcome of the conflux handshakes.
+            conflux_link_rx: oneshot::Receiver<Result<ConfluxHandshakeResult>>,
+            /// The tunnel reactor handle
+            tunnel: Arc<ClientCirc>,
+            /// Data to send on a stream.
+            send_data: Vec<u8>,
+            /// Data we expect to receive on a stream.
+            recv_data: Vec<u8>,
+        },
+    }
+
+    /// Structure for returning the sinks, channels, etc. that must stay
+    /// alive until the test is complete.
+    #[allow(unused, clippy::large_enum_variant)]
+    #[derive(Debug)]
+    #[cfg(feature = "conflux")]
+    enum ConfluxEndpointResult {
+        Circuit {
+            tunnel: Arc<ClientCirc>,
+            stream: DataStream,
+        },
+        Relay {
+            circ: TestCircuitCtx,
+        },
+    }
+
+    /// Stream data, shared by all the mock exit endpoints.
+    #[derive(Debug)]
+    #[cfg(feature = "conflux")]
+    struct ConfluxStreamState {
+        /// The data received so far on this stream.
+        data_recvd: Vec<u8>,
+        /// The total amount of data we expect to receive on this stream.
+        expected_data_len: usize,
+        /// Whether we have seen a BEGIN cell yet.
+        begin_recvd: bool,
+        /// Whether we have seen an END cell yet.
+        end_recvd: bool,
+        /// Whether we have sent an END cell yet.
+        end_sent: bool,
+    }
+
+    /// An object describing a SWITCH cell that we expect to receive
+    /// in the mock exit
+    #[derive(Debug)]
+    #[cfg(feature = "conflux")]
+    struct ExpectedSwitch {
+        /// The number of cells we've seen on this leg so far,
+        /// up to and including the SWITCH.
+        cells_so_far: usize,
+        /// The expected seqno in SWITCH cell,
+        seqno: u32,
+    }
+
+    /// The state of a mock exit.
+    #[derive(Debug)]
+    #[cfg(feature = "conflux")]
+    struct ConfluxExitState<I: Iterator<Item = Option<Duration>>> {
+        /// The runtime.
+        runtime: Arc<AsyncMutex<MockRuntime>>,
+        /// The client view of the tunnel.
+        tunnel: Arc<ClientCirc>,
+        /// The circuit test context.
+        circ: TestCircuitCtx,
+        /// The RTT delay to introduce just before each SENDME.
+        ///
+        /// Used to trigger the client to send a SWITCH.
+        rtt_delays: I,
+        /// State of the (only) expected stream on this tunnel,
+        /// shared by all the mock exit endpoints.
+        stream_state: Arc<Mutex<ConfluxStreamState>>,
+        /// The number of cells after which to expect a SWITCH
+        /// cell from the client.
+        expect_switch: Vec<ExpectedSwitch>,
+        /// Channel for receiving completion notifications from the other leg.
+        done_rx: oneshot::Receiver<()>,
+        /// Channel for sending completion notifications to the other leg.
+        done_tx: oneshot::Sender<()>,
+        /// Whether this circuit leg should act as the primary (sending) leg.
+        is_sending_leg: bool,
+    }
+
+    #[cfg(feature = "conflux")]
+    async fn good_exit_handshake(
+        runtime: &Arc<AsyncMutex<MockRuntime>>,
+        init_rtt_delay: Option<Duration>,
+        rx: &mut Receiver<ChanCell<AnyChanMsg>>,
+        sink: &mut CircuitRxSender,
+    ) {
+        // Wait for the LINK cell
+        let link = await_link_payload(rx).await;
+
+        // Introduce an artificial delay, to make one circ have a better initial RTT
+        // than the other
+        if let Some(init_rtt_delay) = init_rtt_delay {
+            runtime.lock().await.advance_by(init_rtt_delay).await;
+        }
+
+        // Reply with a LINKED cell...
+        let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
+        sink.send(rmsg_to_ccmsg(None, linked)).await.unwrap();
+
+        // Wait for the client to respond with LINKED_ACK...
+        let (_id, chmsg) = rx.next().await.unwrap().into_circid_and_msg();
+        let rmsg = match chmsg {
+            AnyChanMsg::Relay(r) => {
+                AnyRelayMsgOuter::decode_singleton(RelayCellFormat::V0, r.into_relay_body())
+                    .unwrap()
+            }
+            other => panic!("{other:?}"),
+        };
+        let (_streamid, rmsg) = rmsg.into_streamid_and_msg();
+
+        assert!(matches!(rmsg, AnyRelayMsg::ConfluxLinkedAck(_)));
+    }
+
+    #[cfg(feature = "conflux")]
+    async fn run_mock_conflux_exit<I: Iterator<Item = Option<Duration>>>(
+        state: ConfluxExitState<I>,
+    ) -> ConfluxEndpointResult {
+        let ConfluxExitState {
+            runtime,
+            tunnel,
+            mut circ,
+            rtt_delays,
+            stream_state,
+            mut expect_switch,
+            done_tx,
+            mut done_rx,
+            is_sending_leg,
+        } = state;
+
+        let mut rtt_delays = rtt_delays.into_iter();
+
+        // Expect the client to open a stream, and de-multiplex the received stream data
+        let stream_len = stream_state.lock().unwrap().expected_data_len;
+        let mut data_cells_received = 0_usize;
+        let mut cell_count = 0_usize;
+        let mut tags = vec![];
+        let mut streamid = None;
+
+        while stream_state.lock().unwrap().data_recvd.len() < stream_len {
+            use futures::select;
+
+            // Wait for the BEGIN cell to arrive, or for the transfer to complete
+            // (we need to bail if the other leg already completed);
+            let res = select! {
+                res = circ.chan_rx.next() => {
+                    res.unwrap()
+                },
+                res = done_rx => {
+                    res.unwrap();
+                    break;
+                }
+            };
+
+            let (_id, chmsg) = res.into_circid_and_msg();
+            cell_count += 1;
+            let rmsg = match chmsg {
+                AnyChanMsg::Relay(r) => {
+                    AnyRelayMsgOuter::decode_singleton(RelayCellFormat::V0, r.into_relay_body())
+                        .unwrap()
+                }
+                other => panic!("{:?}", other),
+            };
+            let (new_streamid, rmsg) = rmsg.into_streamid_and_msg();
+            if streamid.is_none() {
+                streamid = new_streamid;
+            }
+
+            let begin_recvd = stream_state.lock().unwrap().begin_recvd;
+            let end_recvd = stream_state.lock().unwrap().end_recvd;
+            match rmsg {
+                AnyRelayMsg::Begin(_) if begin_recvd => {
+                    panic!("client tried to open two streams?!");
+                }
+                AnyRelayMsg::Begin(_) if !begin_recvd => {
+                    stream_state.lock().unwrap().begin_recvd = true;
+                    // Reply with a connected cell...
+                    let connected = relaymsg::Connected::new_empty().into();
+                    circ.circ_tx
+                        .send(rmsg_to_ccmsg(streamid, connected))
+                        .await
+                        .unwrap();
+                }
+                AnyRelayMsg::End(_) if !end_recvd => {
+                    stream_state.lock().unwrap().end_recvd = true;
+                    break;
+                }
+                AnyRelayMsg::End(_) if end_recvd => {
+                    panic!("received two END cells for the same stream?!");
+                }
+                AnyRelayMsg::ConfluxSwitch(cell) => {
+                    // Ensure we got the SWITCH after the expected number of cells
+                    let expected = expect_switch.remove(0);
+
+                    assert_eq!(expected.cells_so_far, cell_count);
+                    assert_eq!(expected.seqno, cell.seqno());
+
+                    // To keep the tests simple, we don't handle out of order cells,
+                    // and simply sort the received data at the end.
+                    // This ensures all the data was actually received,
+                    // but it doesn't actually test that the SWITCH cells
+                    // contain the appropriate seqnos.
+                    continue;
+                }
+                AnyRelayMsg::Data(dat) => {
+                    data_cells_received += 1;
+                    stream_state
+                        .lock()
+                        .unwrap()
+                        .data_recvd
+                        .extend_from_slice(dat.as_ref());
+
+                    let is_next_cell_sendme = data_cells_received % 31 == 0;
+                    if is_next_cell_sendme {
+                        if tags.is_empty() {
+                            // Important: we need to make sure all the SENDMEs
+                            // we sent so far have been processed by the reactor
+                            // (otherwise the next QuerySendWindow call
+                            // might return an outdated list of tags!)
+                            runtime.lock().await.advance_until_stalled().await;
+                            let (tx, rx) = oneshot::channel();
+                            tunnel
+                                .command
+                                .unbounded_send(CtrlCmd::QuerySendWindow {
+                                    hop: 2.into(),
+                                    leg: circ.unique_id,
+                                    done: tx,
+                                })
+                                .unwrap();
+
+                            // Get a fresh batch of tags.
+                            let (_window, new_tags) = rx.await.unwrap().unwrap();
+                            tags = new_tags;
+                        }
+
+                        let tag = tags.remove(0);
+
+                        // Introduce an artificial delay, to make one circ have worse RTT
+                        // than the other, and thus trigger a SWITCH
+                        if let Some(rtt_delay) = rtt_delays.next().flatten() {
+                            runtime.lock().await.advance_by(rtt_delay).await;
+                        }
+                        // Make and send a circuit-level SENDME
+                        let sendme = relaymsg::Sendme::from(tag).into();
+
+                        circ.circ_tx
+                            .send(rmsg_to_ccmsg(None, sendme))
+                            .await
+                            .unwrap();
+                    }
+                }
+                _ => panic!("unexpected message {rmsg:?} on leg {}", circ.unique_id),
+            }
+        }
+
+        let end_recvd = stream_state.lock().unwrap().end_recvd;
+
+        // Close the stream if the other endpoint hasn't already done so
+        if is_sending_leg && !end_recvd {
+            let end = relaymsg::End::new_with_reason(relaymsg::EndReason::DONE).into();
+            circ.circ_tx
+                .send(rmsg_to_ccmsg(streamid, end))
+                .await
+                .unwrap();
+            stream_state.lock().unwrap().end_sent = true;
+        }
+
+        // This is allowed to fail, because the other leg might have exited first.
+        let _ = done_tx.send(());
+
+        // Ensure we received all the switch cells we were expecting
+        assert!(
+            expect_switch.is_empty(),
+            "expect_switch = {expect_switch:?}"
+        );
+
+        ConfluxEndpointResult::Relay { circ }
+    }
+
+    #[cfg(feature = "conflux")]
+    async fn run_conflux_client(
+        tunnel: Arc<ClientCirc>,
+        conflux_link_rx: oneshot::Receiver<Result<ConfluxHandshakeResult>>,
+        send_data: Vec<u8>,
+        recv_data: Vec<u8>,
+    ) -> ConfluxEndpointResult {
+        let res = conflux_link_rx.await;
+
+        let res = res.unwrap().unwrap();
+        assert_eq!(res.len(), 2);
+
+        // All circuit legs have completed the conflux handshake,
+        // so we now have a multipath tunnel
+
+        // Now we're ready to open a stream
+        let mut stream = tunnel
+            .begin_stream("www.example.com", 443, None)
+            .await
+            .unwrap();
+
+        stream.write_all(&send_data).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut recv: Vec<u8> = Vec::new();
+        let recv_len = stream.read_to_end(&mut recv).await.unwrap();
+        assert_eq!(recv_len, recv_data.len());
+        assert_eq!(recv_data, recv);
+
+        ConfluxEndpointResult::Circuit { tunnel, stream }
+    }
+
+    #[cfg(feature = "conflux")]
+    async fn run_conflux_endpoint<I: Iterator<Item = Option<Duration>>>(
+        endpoint: ConfluxTestEndpoint<I>,
+    ) -> ConfluxEndpointResult {
+        match endpoint {
+            ConfluxTestEndpoint::Relay(state) => run_mock_conflux_exit(state).await,
+            ConfluxTestEndpoint::Client {
+                tunnel,
+                conflux_link_rx,
+                send_data,
+                recv_data,
+            } => run_conflux_client(tunnel, conflux_link_rx, send_data, recv_data).await,
+        }
+    }
+
+    #[traced_test]
+    #[test]
+    #[cfg(feature = "conflux")]
+    fn multipath_stream() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            /// The number of data cells to send.
+            const NUM_CELLS: usize = 300;
+            /// 498 bytes per DATA cell.
+            const CELL_SIZE: usize = 498;
+
+            let TestTunnelCtx {
+                tunnel,
+                circs,
+                conflux_link_rx,
+            } = setup_good_conflux_tunnel(&rt).await;
+            let [circ1, circ2]: [TestCircuitCtx; 2] = circs.try_into().unwrap();
+
+            // The stream data we're going to send over the conflux tunnel
+            let mut send_data = (0..255_u8)
+                .cycle()
+                .take(NUM_CELLS * CELL_SIZE)
+                .collect::<Vec<_>>();
+            let stream_state = Arc::new(Mutex::new(ConfluxStreamState {
+                data_recvd: vec![],
+                expected_data_len: send_data.len(),
+                begin_recvd: false,
+                end_recvd: false,
+                end_sent: false,
+            }));
+
+            let mut tasks = vec![];
+
+            // Channels used by the mock relays to notify each other
+            // of stream transfer completion.
+            let (tx1, rx1) = oneshot::channel();
+            let (tx2, rx2) = oneshot::channel();
+
+            // The 9 RTT delays to insert before each of the 9 SENDMEs
+            // the exit will end up sending.
+            //
+            // Note: the first delay is the init_rtt delay (measured during the conflux HS).
+            let circ1_rtt_delays = [
+                // Initially, circ1 has better RTT, so we will start on this leg.
+                Some(Duration::from_millis(100)),
+                // But then its RTT takes a turn for the worse,
+                // triggering a switch after the first SENDME is processed
+                // (this happens after sending 123 DATA cells).
+                Some(Duration::from_millis(500)),
+                Some(Duration::from_millis(700)),
+                Some(Duration::from_millis(900)),
+                Some(Duration::from_millis(1100)),
+                Some(Duration::from_millis(1300)),
+                Some(Duration::from_millis(1500)),
+                Some(Duration::from_millis(1700)),
+                Some(Duration::from_millis(1900)),
+                Some(Duration::from_millis(2100)),
+            ]
+            .into_iter();
+
+            let circ2_rtt_delays = [
+                Some(Duration::from_millis(200)),
+                Some(Duration::from_millis(400)),
+                Some(Duration::from_millis(600)),
+                Some(Duration::from_millis(800)),
+                Some(Duration::from_millis(1000)),
+                Some(Duration::from_millis(1200)),
+                Some(Duration::from_millis(1400)),
+                Some(Duration::from_millis(1600)),
+                Some(Duration::from_millis(1800)),
+                Some(Duration::from_millis(2000)),
+            ]
+            .into_iter();
+
+            // Note: we can't have two advance_by() calls running
+            // at the same time (it's a limitation of MockRuntime),
+            // so we need to be careful to not cause concurrent delays
+            // on the two circuits.
+            let relays = [
+                (
+                    circ1,
+                    tx1,
+                    rx2,
+                    vec![ExpectedSwitch {
+                        // We start on this leg, and receive a BEGIN cell,
+                        // followed by (4 * 31 - 1) = 123 DATA cells.
+                        // Then it becomes blocked on CC, then finally the reactor
+                        // realizes it has some SENDMEs to process, and
+                        // then as a result of the new RTT measurement, we switch to circ1,
+                        // and then finally we switch back here, and get another SWITCH
+                        // as the 126th cell.
+                        cells_so_far: 126,
+                        // Leg 2 switches back to this leg after the 249th cell
+                        // (just before sending the 250th one):
+                        // seqno = 125 carried over from leg 1 (see the seqno of the
+                        // SWITCH expected on leg 2 below), plus 1 SWITCH, plus
+                        // 4 * 31 = 124 DATA cells after which the RTT of the first leg
+                        // is deemed favorable again.
+                        //
+                        // 249 - 125 (last_seq_sent of leg 1) = 124
+                        seqno: 124,
+                    }],
+                    circ1_rtt_delays,
+                    true,
+                ),
+                (
+                    circ2,
+                    tx2,
+                    rx1,
+                    vec![ExpectedSwitch {
+                        // The SWITCH is the first cell we received after the conflux HS
+                        // on this leg.
+                        cells_so_far: 1,
+                        // See explanation on the ExpectedSwitch from circ1 above.
+                        seqno: 125,
+                    }],
+                    circ2_rtt_delays,
+                    false,
+                ),
+            ];
+
+            let relay_runtime = Arc::new(AsyncMutex::new(rt.clone()));
+            for (mut circ, done_tx, done_rx, expect_switch, mut rtt_delays, is_sending_leg) in
+                relays.into_iter()
+            {
+                let leg = circ.unique_id;
+
+                // Do the conflux handshake
+                //
+                // We do this outside of run_conflux_endpoint,
+                // toa void running both handshakes at concurrently
+                // (this gives more predictable RTT delays:
+                // if both handshake tasks run at once, they race
+                // to advance the mock runtime's clock)
+                good_exit_handshake(
+                    &relay_runtime,
+                    rtt_delays.next().flatten(),
+                    &mut circ.chan_rx,
+                    &mut circ.circ_tx,
+                )
+                .await;
+
+                let relay = ConfluxTestEndpoint::Relay(ConfluxExitState {
+                    runtime: Arc::clone(&relay_runtime),
+                    tunnel: Arc::clone(&tunnel),
+                    circ,
+                    rtt_delays,
+                    stream_state: Arc::clone(&stream_state),
+                    expect_switch,
+                    done_tx,
+                    done_rx,
+                    is_sending_leg,
+                });
+
+                tasks.push(rt.spawn_join(format!("relay task {leg}"), run_conflux_endpoint(relay)));
+            }
+
+            tasks.push(rt.spawn_join(
+                "client task".to_string(),
+                run_conflux_endpoint(ConfluxTestEndpoint::Client {
+                    tunnel,
+                    conflux_link_rx,
+                    send_data: send_data.clone(),
+                    recv_data: vec![],
+                }),
+            ));
+            let _sinks = futures::future::join_all(tasks).await;
+            let mut stream_state = stream_state.lock().unwrap();
+            assert!(stream_state.begin_recvd);
+
+            stream_state.data_recvd.sort();
+            send_data.sort();
+            assert_eq!(stream_state.data_recvd, send_data);
+        });
+    }
+
+    #[traced_test]
+    #[test]
+    #[cfg(all(feature = "conflux", feature = "hs-service"))]
+    fn conflux_incoming_stream() {
+        tor_rtmock::MockRuntime::test_with_various(|rt| async move {
+            use std::error::Error as _;
+
+            const EXPECTED_HOP: u8 = 1;
+
+            let TestTunnelCtx {
+                tunnel,
+                circs,
+                conflux_link_rx,
+            } = setup_good_conflux_tunnel(&rt).await;
+
+            let [mut circ1, mut circ2]: [TestCircuitCtx; 2] = circs.try_into().unwrap();
+
+            let link = await_link_payload(&mut circ1.chan_rx).await;
+            for circ in [&mut circ1, &mut circ2] {
+                let linked = relaymsg::ConfluxLinked::new(link.payload().clone()).into();
+                circ.circ_tx
+                    .send(rmsg_to_ccmsg(None, linked))
+                    .await
+                    .unwrap();
+            }
+
+            let conflux_hs_res = conflux_link_rx.await.unwrap().unwrap();
+            assert!(conflux_hs_res.iter().all(|res| res.is_ok()));
+
+            // TODO(#2002): we don't currently support conflux for onion services
+            let err = tunnel
+                .allow_stream_requests(
+                    &[tor_cell::relaycell::RelayCmd::BEGIN],
+                    (tunnel.unique_id(), EXPECTED_HOP.into()).into(),
+                    AllowAllStreamsFilter,
+                )
+                .await
+                // IncomingStream doesn't impl Debug, so we need to map to a different type
+                .map(|_| ())
+                .unwrap_err();
+
+            let err_src = err.source().unwrap();
+            assert!(err_src
+                .to_string()
+                .contains("Cannot allow stream requests on tunnel with 2 legs"));
+        });
+    }
+
+    // TODO: add a test where the client receives data on a multipath stream,
+    // and ensure it handles ooo cells correctly
 }

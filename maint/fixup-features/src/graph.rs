@@ -3,6 +3,10 @@
 //! I had hoped to use petgraph, but it is optimized for efficiency over
 //! usability, and I got lost in a maze of indices.
 
+// @@ begin lint list maintained by maint/add_warning @@
+
+//! <!-- @@ end lint list maintained by maint/add_warning @@ -->
+
 // @@ begin test lint list maintained by maint/add_warning @@
 #![allow(clippy::bool_assert_comparison)]
 #![allow(clippy::clone_on_copy)]

@@ -22,12 +22,10 @@ variables:
   FF_TIMESTAMPS: "true"
   # Pinned CI image for must Rust tests
   # Using "amd64/" single-arch variant to work around https://gitlab.torproject.org/tpo/tpa/team/-/issues/41621.
-  RECENT_RUST_IMAGE: "${DOCKER_REGISTRY_URL}/amd64/rust:1.83.0-bookworm"
+  RECENT_RUST_IMAGE: "${DOCKER_REGISTRY_URL}/amd64/rust:1.86.0-bookworm"
   # Pinned chutney version.
-  # TODO: Consider unpinning once chutney's CI is running arti's CI.
-  # Alternatively if we decide to keep this, consider to actually start managing
-  # versions in chutney and using a version tag here.
-  CHUTNEY_COMMIT: b05403758dc81593256a93a10d896e68e0398fe7
+  # Last updated 2025-05-29
+  CHUTNEY_COMMIT: "81644208aa7367857693a60addee3e792a6c9625"
 
 default:
   image:
@@ -174,6 +172,7 @@ rust-checks:
     - ./maint/cargo_sort
     - ./maint/check_tree
     - ./maint/check_all_lockfiles
+    - ./maint/check_wildcard
     - ./maint/common/forbid-hard-tabs
   cache:
     paths:
@@ -433,7 +432,7 @@ coverage:
 minimal-versions:
   stage: test
   # Using "amd64/" single-arch variant to work around https://gitlab.torproject.org/tpo/tpa/team/-/issues/41621.
-  image: ${DOCKER_REGISTRY_URL}/amd64/rust:1.77
+  image: ${DOCKER_REGISTRY_URL}/amd64/rust:1.83
   needs: ["rust-checks"]
   script:
     - rustup install nightly
@@ -447,7 +446,7 @@ minimal-versions:
     TARGET: UNDEFINED--BUG-IN-CI-YAML
   # If you upgrade this image, also change the one in docker_reproducible_build.
   # Using "amd64/" single-arch variant to work around https://gitlab.torproject.org/tpo/tpa/team/-/issues/41621.
-  image: ${DOCKER_REGISTRY_URL}/amd64/rust:1.77.0-alpine3.18
+  image: ${DOCKER_REGISTRY_URL}/amd64/rust:1.86.0-alpine3.21
   script:
     - apk add bash
     - ./maint/reproducible_build $TARGET
@@ -492,8 +491,8 @@ build-shadow:
   variables:
     JOB_SHADOW_REPO: "https://github.com/shadow/shadow.git"
     JOB_SHADOW_BRANCH: "main"
-    # 2025-04-24: Last bumped primarily to get tcp FIN fix: https://github.com/shadow/shadow/issues/3100
-    JOB_SHADOW_COMMIT: "77d0651dee7ead0e8127bc793856a4af3f866a7d"
+    # Last updated 2025-05-05
+    JOB_SHADOW_COMMIT: "a24f2c320d64f979f7208736170554db2626b177"
   artifacts:
     paths:
       - opt/shadow
@@ -533,7 +532,7 @@ integration-chutney:
    - when: never
   script:
     - ./maint/preserve -u
-    - maint/common/apt-install tor git python3 curl dnsutils python3-pip python3-venv
+    - maint/common/apt-install tor git python3 curl dnsutils python3-pip python3-venv jq
 
     # arti runtime dependencies
     - maint/common/apt-install libsqlite3-0 libssl3
@@ -560,6 +559,10 @@ integration-chutney-shadow:
     - tpa
   script:
     - ./maint/preserve -u
+
+    # Add tor deb repository to get recent c-tor
+    - maint/add-deb-torproject-org bookworm
+
     - maint/common/apt-install
         tor
         git
@@ -570,6 +573,7 @@ integration-chutney-shadow:
         python3-yaml
         python3-pip
         python3-venv
+        jq
 
     # arti runtime dependencies
     - maint/common/apt-install libsqlite3-0 libssl3
@@ -611,6 +615,10 @@ integration-shadow:
       - opt/tgen
   script:
     - ./maint/preserve -u
+
+    # Add tor deb repository to get recent c-tor
+    - section_start "Add tor dpkg repo"
+    - maint/add-deb-torproject-org bookworm
 
     - section_start "Install utility packages"
     - maint/common/apt-install git tor obfs4proxy stow tshark

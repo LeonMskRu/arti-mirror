@@ -346,11 +346,14 @@ impl IntroRequest {
         let params = onion_circparams_from_netparams(netdir.params())
             .map_err(into_internal!("Unable to build CircParameters"))?;
 
+        // TODO CC: We may be able to do better based on the client's handshake message.
+        let protocols = netdir.client_protocol_status().required_protocols().clone();
+
         // We won't need the netdir any longer; stop holding the reference.
         drop(netdir);
 
         let last_real_hop = circuit
-            .last_hop_num()
+            .last_hop()
             .map_err(into_internal!("Circuit with no final hop"))?;
 
         // Add a virtual hop.
@@ -359,13 +362,14 @@ impl IntroRequest {
                 handshake::RelayProtocol::HsV3,
                 handshake::HandshakeRole::Responder,
                 self.key_gen,
-                params,
+                &params,
+                &protocols,
             )
             .await
             .map_err(E::VirtualHop)?;
 
         let virtual_hop = circuit
-            .last_hop_num()
+            .last_hop()
             .map_err(into_internal!("Circuit with no virtual hop"))?;
 
         // Accept begins from that virtual hop
@@ -385,5 +389,10 @@ impl IntroRequest {
             stream_requests,
             circuit,
         })
+    }
+
+    /// Get the [`IntroduceHandshakePayload`] associated with this [`IntroRequest`].
+    pub(crate) fn intro_payload(&self) -> &IntroduceHandshakePayload {
+        &self.intro_payload
     }
 }

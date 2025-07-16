@@ -9,11 +9,9 @@ use derive_builder::Builder;
 use tor_config::{impl_standard_builder, ConfigBuildError};
 use tor_units::Percentage;
 
-use crate::circuit::CircParameters;
-
 /// Fixed window parameters that are for the SENDME v0 world of fixed congestion window.
 #[non_exhaustive]
-#[derive(Builder, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Copy, Clone, Debug, amplify::Getters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct FixedWindowParams {
     /// Circuit window starting point. From the "circwindow" param.
@@ -31,7 +29,7 @@ impl_standard_builder! { FixedWindowParams: !Deserialize + !Default }
 /// Vegas queuing parameters taken from the consensus only which are different depending if the
 /// circuit is an onion service one, an exit or used for SBWS.
 #[non_exhaustive]
-#[derive(Clone, Debug, amplify::Getters)]
+#[derive(Copy, Clone, Debug, amplify::Getters)]
 pub struct VegasQueueParams {
     /// Alpha parameter is used to know when to increase the window.
     #[getter(as_copy)]
@@ -69,7 +67,7 @@ impl From<(u32, u32, u32, u32, u32)> for VegasQueueParams {
 
 /// Vegas algorithm parameters taken from the consensus.
 #[non_exhaustive]
-#[derive(Builder, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Copy, Clone, Debug, amplify::Getters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct VegasParams {
     /// The amount of queued cells that Vegas can tolerate before reacting.
@@ -187,12 +185,12 @@ impl CongestionWindowParams {
 pub struct CongestionControlParams {
     /// The congestion control algorithm to use.
     alg: Algorithm,
-    /// This is the fallback algorithm in case the one we have in the consensus is not supported by
-    /// the relay we are connecting to. Reminder that these parameteres are per-hop.
+    /// Parameters to the fallback fixed-window algorithm, which we use
+    /// when the one in `alg` is not supported by a given relay.
     ///
     /// It is put in here because by the time we do path selection, we don't have access to the
     /// consensus and so we have to keep our fallback ready.
-    fallback_alg: Algorithm,
+    fixed_window_params: FixedWindowParams,
     /// Congestion window parameters.
     #[getter(as_mut)]
     cwnd_params: CongestionWindowParams,
@@ -211,14 +209,14 @@ impl CongestionControlParams {
     }
 
     /// Make these parameters to use the fallback algorithm. This can't be reversed.
-    pub fn use_fallback_alg(&mut self) {
-        self.alg = self.fallback_alg.clone();
+    pub(crate) fn use_fallback_alg(&mut self) {
+        self.alg = Algorithm::FixedWindow(self.fixed_window_params);
     }
 }
 
 /// Return true iff the given sendme increment is valid with regards to the value in the circuit
 /// parameters that is taken from the consensus.
-pub(crate) fn is_sendme_inc_valid(inc: u8, params: &CircParameters) -> bool {
+pub(crate) fn is_sendme_inc_valid(inc: u8, params: &CongestionControlParams) -> bool {
     // Ease our lives a bit because the consensus value is u32.
     let inc_u32 = u32::from(inc);
     // A consensus value of 1 would allow this sendme increment to be 0 and thus
@@ -226,7 +224,7 @@ pub(crate) fn is_sendme_inc_valid(inc: u8, params: &CircParameters) -> bool {
     if inc == 0 {
         return false;
     }
-    let inc_consensus = params.ccontrol.cwnd_params().sendme_inc();
+    let inc_consensus = params.cwnd_params().sendme_inc();
     // See prop324 section 10.3
     if inc_u32 > (inc_consensus.saturating_add(1)) || inc_u32 < (inc_consensus.saturating_sub(1)) {
         return false;
@@ -237,14 +235,13 @@ pub(crate) fn is_sendme_inc_valid(inc: u8, params: &CircParameters) -> bool {
 #[cfg(test)]
 mod test {
     use crate::{
-        ccparams::is_sendme_inc_valid, circuit::CircParameters,
-        congestion::test_utils::params::build_cc_vegas_params,
+        ccparams::is_sendme_inc_valid, congestion::test_utils::params::build_cc_vegas_params,
     };
 
     #[test]
     fn test_sendme_inc_valid() {
-        let params = CircParameters::new(true, build_cc_vegas_params());
-        let ref_inc = params.ccontrol.cwnd_params().sendme_inc() as u8;
+        let params = build_cc_vegas_params();
+        let ref_inc = params.cwnd_params().sendme_inc() as u8;
 
         // In range.
         assert!(is_sendme_inc_valid(ref_inc, &params));

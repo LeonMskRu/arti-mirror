@@ -96,17 +96,21 @@ pub(crate) trait AbstractCirc: Debug {
 
     /// Return a [`Path`] object describing all the hops in this circuit.
     ///
+    /// Returns an error if the circuit is closed.
+    ///
     /// Note that this `Path` is not automatically updated if the circuit is
     /// extended.
-    fn path_ref(&self) -> Arc<Path>;
+    fn path_ref(&self) -> tor_proto::Result<Arc<Path>>;
 
     /// Return the number of hops in this circuit.
+    ///
+    /// Returns an error if the circuit is closed.
     ///
     /// NOTE: This function will currently return only the number of hops
     /// _currently_ in the circuit. If there is an extend operation in progress,
     /// the currently pending hop may or may not be counted, depending on whether
     /// the extend operation finishes before this call is done.
-    fn n_hops(&self) -> usize;
+    fn n_hops(&self) -> tor_proto::Result<usize>;
 
     /// Return true if this circuit is closed and therefore unusable.
     fn is_closing(&self) -> bool;
@@ -114,8 +118,8 @@ pub(crate) trait AbstractCirc: Debug {
     /// Return a process-unique identifier for this circuit.
     fn unique_id(&self) -> UniqId;
 
-    /// Extend the circuit via the ntor handshake to a new target last hop.
-    async fn extend_ntor<T: CircTarget + Sync>(
+    /// Extend the circuit via the most appropriate handshake to a new `target` hop.
+    async fn extend<T: CircTarget + Sync>(
         &self,
         target: &T,
         params: CircParameters,
@@ -232,10 +236,10 @@ pub(crate) trait AbstractCircBuilder<R: Runtime>: Send + Sync {
     /// Return `Ok(true)` if we saved, and `Ok(false)` if we didn't hold the lock.
     fn save_state(&self) -> Result<bool>;
 
-    /// Return this builder's [`PathConfig`](crate::PathConfig).
+    /// Return this builder's [`PathConfig`].
     fn path_config(&self) -> Arc<PathConfig>;
 
-    /// Replace this builder's [`PathConfig`](crate::PathConfig).
+    /// Replace this builder's [`PathConfig`].
     // TODO: This is dead_code because we only call this for the CircuitBuilder specialization of
     // CircMgr, not from the generic version, because this trait doesn't provide guardmgr, which is
     // needed by the [`CircMgr::reconfigure`] function that would be the only caller of this. We
@@ -784,6 +788,7 @@ impl<B: AbstractCircBuilder<R> + 'static, R: Runtime> AbstractCircMgr<B, R> {
     /// under the assumption that it will be used for that spec.
     ///
     /// This is the primary entry point for AbstractCircMgr.
+    #[allow(clippy::cognitive_complexity)] // TODO #2010: Refactor?
     pub(crate) async fn get_or_launch(
         self: &Arc<Self>,
         usage: &TargetCircUsage,
@@ -1003,6 +1008,7 @@ impl<B: AbstractCircBuilder<R> + 'static, R: Runtime> AbstractCircMgr<B, R> {
 
     /// Execute an action returned by pick-action, and return the
     /// resulting circuit or error.
+    #[allow(clippy::cognitive_complexity)] // TODO #2010: Refactor
     async fn take_action(
         self: Arc<Self>,
         act: Action<B, R>,
@@ -1534,7 +1540,7 @@ mod test {
     use crate::mocks::{FakeBuilder, FakeCirc, FakeId, FakeOp};
     use crate::usage::{ExitPolicy, SupportedCircUsage};
     use crate::{Error, IsolationToken, StreamIsolation, TargetCircUsage, TargetPort, TargetPorts};
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
     use tor_guardmgr::fallback::FallbackList;
     use tor_guardmgr::TestConfig;
     use tor_llcrypto::pk::ed25519::Ed25519Identity;
@@ -1546,7 +1552,7 @@ mod test {
     #[allow(deprecated)] // TODO #1885
     use tor_rtmock::MockSleepRuntime;
 
-    static FALLBACKS_EMPTY: Lazy<FallbackList> = Lazy::new(|| [].into());
+    static FALLBACKS_EMPTY: LazyLock<FallbackList> = LazyLock::new(|| [].into());
 
     fn di() -> DirInfo<'static> {
         (&*FALLBACKS_EMPTY).into()

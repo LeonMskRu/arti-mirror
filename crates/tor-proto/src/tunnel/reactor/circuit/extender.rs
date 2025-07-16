@@ -1,15 +1,15 @@
 //! Module providing [`CircuitExtender`].
 
 use super::{Circuit, ReactorResultChannel};
-use crate::congestion;
+use crate::circuit::HopSettings;
 use crate::crypto::cell::{
     ClientLayer, CryptInit, HopNum, InboundClientLayer, OutboundClientLayer,
 };
 use crate::crypto::handshake::fast::CreateFastClient;
 use crate::crypto::handshake::ntor_v3::NtorV3Client;
-use crate::tunnel::circuit::unique_id::UniqId;
-use crate::tunnel::circuit::CircParameters;
 use crate::tunnel::reactor::MetaCellDisposition;
+use crate::tunnel::TunnelScopedCircId;
+use crate::{congestion, HopLocation};
 use crate::{Error, Result};
 use oneshot_fused_workaround as oneshot;
 use std::borrow::Borrow;
@@ -23,7 +23,7 @@ use crate::crypto::handshake::ntor::NtorClient;
 use crate::crypto::handshake::{ClientHandshake, KeyGenerator};
 use crate::tunnel::circuit::path;
 use crate::tunnel::reactor::{MetaCellHandler, SendRelayCell};
-use tor_cell::relaycell::extend::NtorV3Extension;
+use tor_cell::relaycell::extend::CircResponseExt;
 use tor_linkspec::{EncodedLinkSpec, OwnedChanTarget};
 use tracing::trace;
 
@@ -41,10 +41,10 @@ where
     peer_id: OwnedChanTarget,
     /// Handshake state.
     state: Option<H::StateType>,
-    /// Parameters used for this extension.
-    params: CircParameters,
+    /// In-progress settings that we're negotiating for this hop.
+    settings: HopSettings,
     /// An identifier for logging about this reactor's circuit.
-    unique_id: UniqId,
+    unique_id: TunnelScopedCircId,
     /// The hop we're expecting the EXTENDED2 cell to come back from.
     expected_hop: HopNum,
     /// The relay cell format we intend to use for this hop.
@@ -83,7 +83,7 @@ where
         handshake_id: HandshakeType,
         key: &H::KeyType,
         linkspecs: Vec<EncodedLinkSpec>,
-        params: CircParameters,
+        settings: HopSettings,
         client_aux_data: &impl Borrow<H::ClientAuxData>,
         circ: &mut Circuit,
         done: ReactorResultChannel<()>,
@@ -96,10 +96,10 @@ where
             let n_hops = circ.crypto_out.n_layers();
             let hop = ((n_hops - 1) as u8).into();
             trace!(
-                "{}: Extending circuit to hop {} with {:?}",
-                unique_id,
-                n_hops + 1,
-                linkspecs
+                circ_id = %unique_id,
+                target_hop = n_hops + 1,
+                linkspecs = ?linkspecs,
+                "Extending circuit",
             );
             let extend_msg = Extend2::new(linkspecs, handshake_id, msg);
             let cell = AnyRelayMsgOuter::new(None, extend_msg.into());
@@ -110,12 +110,12 @@ where
                 cell,
             };
 
-            trace!("{}: waiting for EXTENDED2 cell", unique_id);
+            trace!(circ_id = %unique_id, "waiting for EXTENDED2 cell");
             // ... and now we wait for a response.
             let extender = Self {
                 peer_id,
                 state: Some(state),
-                params,
+                settings,
                 unique_id,
                 expected_hop: hop,
                 operation_finished: None,
@@ -153,8 +153,8 @@ where
         let relay_handshake = msg.into_body();
 
         trace!(
-            "{}: Received EXTENDED2 cell; completing handshake.",
-            self.unique_id
+            circ_id = %self.unique_id,
+            "Received EXTENDED2 cell; completing handshake.",
         );
         // Now perform the second part of the handshake, and see if it
         // succeeded.
@@ -167,11 +167,11 @@ where
 
         // Handle auxiliary data returned from the server, e.g. validating that
         // requested extensions have been acknowledged.
-        H::handle_server_aux_data(&mut self.params, &server_aux_data)?;
+        H::handle_server_aux_data(&mut self.settings, &server_aux_data)?;
 
         let layer = L::construct(keygen)?;
 
-        trace!("{}: Handshake complete; circuit extended.", self.unique_id);
+        trace!(circ_id = %self.unique_id, "Handshake complete; circuit extended.");
 
         // If we get here, it succeeded.  Add a new hop to the circuit.
         let (layer_fwd, layer_back, binding) = layer.split_client_layer();
@@ -181,7 +181,7 @@ where
             Box::new(layer_fwd),
             Box::new(layer_back),
             Some(binding),
-            &self.params,
+            &self.settings,
         )?;
         Ok(MetaCellDisposition::ConversationFinished)
     }
@@ -196,8 +196,8 @@ where
     FWD: OutboundClientLayer + 'static + Send,
     REV: InboundClientLayer + 'static + Send,
 {
-    fn expected_hop(&self) -> HopNum {
-        self.expected_hop
+    fn expected_hop(&self) -> HopLocation {
+        (self.unique_id.unique_id(), self.expected_hop).into()
     }
     fn handle_msg(
         &mut self,
@@ -238,15 +238,15 @@ pub(crate) trait HandshakeAuxDataHandler: ClientHandshake {
     /// Handle auxiliary handshake data returned when creating or extending a
     /// circuit.
     fn handle_server_aux_data(
-        params: &mut CircParameters,
+        settings: &mut HopSettings,
         data: &<Self as ClientHandshake>::ServerAuxData,
     ) -> Result<()>;
 }
 
 impl HandshakeAuxDataHandler for NtorV3Client {
     fn handle_server_aux_data(
-        params: &mut CircParameters,
-        data: &Vec<NtorV3Extension>,
+        settings: &mut HopSettings,
+        data: &Vec<CircResponseExt>,
     ) -> Result<()> {
         // Process all extensions.
         // If "flowctl-cc" is not enabled, this loop will always return an error, so tell clippy
@@ -254,28 +254,30 @@ impl HandshakeAuxDataHandler for NtorV3Client {
         #[cfg_attr(not(feature = "flowctl-cc"), allow(clippy::never_loop))]
         for ext in data {
             match ext {
-                NtorV3Extension::AckCongestionControl { sendme_inc } => {
+                CircResponseExt::CcResponse(ack_ext) => {
                     cfg_if::cfg_if! {
                         if #[cfg(feature = "flowctl-cc")] {
                             // Unexpected ACK extension as in if CC is disabled on our side, we would never have
                             // requested it. Reject and circuit must be closed.
-                            if !params.ccontrol.is_enabled() {
+                            if !settings.ccontrol.is_enabled() {
                                 return Err(Error::HandshakeProto(
                                     "Received unexpected ntorv3 CC ack extension".into(),
                                 ));
                             }
+                            let sendme_inc = ack_ext.sendme_inc();
                             // Invalid increment, reject and circuit must be closed.
-                            if !congestion::params::is_sendme_inc_valid(*sendme_inc, params) {
+                            if !congestion::params::is_sendme_inc_valid(sendme_inc, &settings.ccontrol) {
                                 return Err(Error::HandshakeProto(
                                     "Received invalid sendme increment in CC ntorv3 extension".into(),
                                 ));
                             }
                             // Excellent, we have a negotiated sendme increment. Set it for this circuit.
-                            params
+                            settings
                                 .ccontrol
                                 .cwnd_params_mut()
-                                .set_sendme_inc(*sendme_inc);
+                                .set_sendme_inc(sendme_inc);
                         } else {
+                            let _ = ack_ext;
                             return Err(Error::HandshakeProto(
                                 "Received unexpected `AckCongestionControl` ntorv3 extension".into(),
                             ));
@@ -295,14 +297,14 @@ impl HandshakeAuxDataHandler for NtorV3Client {
 }
 
 impl HandshakeAuxDataHandler for NtorClient {
-    fn handle_server_aux_data(_params: &mut CircParameters, _data: &()) -> Result<()> {
+    fn handle_server_aux_data(_settings: &mut HopSettings, _data: &()) -> Result<()> {
         // This handshake doesn't have any auxiliary data; nothing to do.
         Ok(())
     }
 }
 
 impl HandshakeAuxDataHandler for CreateFastClient {
-    fn handle_server_aux_data(_params: &mut CircParameters, _data: &()) -> Result<()> {
+    fn handle_server_aux_data(_settings: &mut HopSettings, _data: &()) -> Result<()> {
         // This handshake doesn't have any auxiliary data; nothing to do.
         Ok(())
     }

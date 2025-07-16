@@ -6,6 +6,7 @@
 
 use derive_more::{Add, Display, Div, From, FromStr, Mul};
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -391,6 +392,7 @@ impl<const H: i32, const L: i32> TryFrom<i32> for IntegerSeconds<BoundedInt32<H,
     }
 }
 
+#[derive(Deserialize, Serialize)] //
 #[derive(Copy, Clone, From, FromStr, Display, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
 /// This type represents an integer number of minutes.
 ///

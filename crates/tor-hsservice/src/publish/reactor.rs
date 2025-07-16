@@ -77,6 +77,7 @@ use tor_config::file_watcher::{
     self, Event as FileEvent, FileEventReceiver, FileEventSender, FileWatcher, FileWatcherBuilder,
 };
 use tor_config_path::{CfgPath, CfgPathResolver};
+use tor_dirclient::SourceInfo;
 use tor_netdir::{DirEvent, NetDir};
 
 use crate::config::restricted_discovery::{
@@ -182,6 +183,9 @@ pub(super) struct Reactor<R: Runtime, M: Mockable> {
     shutdown_tx: broadcast::Sender<Void>,
     /// Path resolver for configuration files.
     path_resolver: Arc<CfgPathResolver>,
+    /// Queue on which we receive messages from the [`PowManager`] telling us that a seed has
+    /// rotated and thus we need to republish the descriptor for a particular time period.
+    update_from_pow_manager_rx: mpsc::Receiver<TimePeriod>,
 }
 
 /// The immutable, shared state of the descriptor publisher reactor.
@@ -199,6 +203,8 @@ struct Immutable<R: Runtime, M: Mockable> {
     keymgr: Arc<KeyMgr>,
     /// A sender for updating the status of the onion service.
     status_tx: PublisherStatusSender,
+    /// Proof-of-work state.
+    pow_manager: Arc<PowManager<R>>,
 }
 
 impl<R: Runtime, M: Mockable> Immutable<R, M> {
@@ -315,6 +321,9 @@ pub(crate) trait MockableClientCirc: Send + Sync {
     /// Start a new stream to the last relay in the circuit, using
     /// a BEGIN_DIR cell.
     async fn begin_dir_stream(self: Arc<Self>) -> Result<Self::DataStream, tor_proto::Error>;
+
+    /// Try to get a SourceInfo for this circuit, for using it in a directory request.
+    fn source_info(&self) -> tor_proto::Result<Option<SourceInfo>>;
 }
 
 #[async_trait]
@@ -323,6 +332,10 @@ impl MockableClientCirc for ClientCirc {
 
     async fn begin_dir_stream(self: Arc<Self>) -> Result<Self::DataStream, tor_proto::Error> {
         ClientCirc::begin_dir_stream(self).await
+    }
+
+    fn source_info(&self) -> tor_proto::Result<Option<SourceInfo>> {
+        SourceInfo::from_circuit(self)
     }
 }
 
@@ -537,6 +550,19 @@ pub enum UploadError {
 }
 define_asref_dyn_std_error!(UploadError);
 
+impl UploadError {
+    /// Return true if this error is one that we should report as a suspicious event,
+    /// along with the dirserver, and description of the relevant document.
+    pub(crate) fn should_report_as_suspicious(&self) -> bool {
+        match self {
+            UploadError::Request(e) => e.error.should_report_as_suspicious_if_anon(),
+            UploadError::Circuit(_) => false, // TODO prop360
+            UploadError::Stream(_) => false,  // TODO prop360
+            UploadError::Bug(_) => false,
+        }
+    }
+}
+
 impl<R: Runtime, M: Mockable> Reactor<R, M> {
     /// Create a new `Reactor`.
     #[allow(clippy::too_many_arguments)]
@@ -551,6 +577,8 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
         status_tx: PublisherStatusSender,
         keymgr: Arc<KeyMgr>,
         path_resolver: Arc<CfgPathResolver>,
+        pow_manager: Arc<PowManager<R>>,
+        update_from_pow_manager_rx: mpsc::Receiver<TimePeriod>,
     ) -> Self {
         /// The maximum size of the upload completion notifier channel.
         ///
@@ -581,6 +609,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             nickname,
             keymgr,
             status_tx,
+            pow_manager,
         };
 
         let inner = Inner {
@@ -607,6 +636,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             upload_task_complete_tx,
             shutdown_tx,
             path_resolver,
+            update_from_pow_manager_rx,
         }
     }
 
@@ -660,6 +690,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
     }
 
     /// Run one iteration of the reactor loop.
+    #[allow(clippy::cognitive_complexity)] // TODO: Refactor
     async fn run_once(&mut self) -> Result<ShutdownStatus, FatalError> {
         let mut netdir_events = self.dir_provider.events();
 
@@ -797,6 +828,14 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                     self.update_publish_status_unless_waiting(PublishStatus::Idle).await?;
                     self.upload_all().await?;
                 }
+            }
+            update_tp_pow_seed = self.update_from_pow_manager_rx.next().fuse() => {
+                debug!("Update PoW seed for TP!");
+                let Some(time_period) = update_tp_pow_seed else {
+                    return Ok(ShutdownStatus::Terminate);
+                };
+                self.mark_dirty(&time_period);
+                self.upload_all().await?;
             }
         }
 
@@ -1296,6 +1335,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
     /// The results are received and processed in the main loop of the reactor.
     ///
     /// Returns an error if it fails to spawn a task, or if an internal error occurs.
+    #[allow(clippy::cognitive_complexity)] // TODO #2010: Refactor
     async fn upload_all(&mut self) -> Result<(), FatalError> {
         trace!("starting descriptor upload task...");
 
@@ -1411,6 +1451,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
     /// Failed uploads are retried
     /// (see [`upload_descriptor_with_retries`](Reactor::upload_descriptor_with_retries)).
     #[allow(clippy::too_many_arguments)] // TODO: refactor
+    #[allow(clippy::cognitive_complexity)] // TODO: Refactor
     async fn upload_for_time_period(
         hs_dirs: Vec<RelayIds>,
         netdir: &Arc<NetDir>,
@@ -1453,6 +1494,12 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             #[error("{0}")]
             Fatal(#[from] FatalError),
         }
+
+        let max_hsdesc_len: usize = netdir
+            .params()
+            .hsdir_max_desc_size
+            .try_into()
+            .expect("Unable to convert positive int32 to usize!?");
 
         let upload_results = futures::stream::iter(hs_dirs)
             .map(|relay_ids| {
@@ -1543,6 +1590,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
 
                             build_sign(
                                 &imm.keymgr,
+                                &imm.pow_manager,
                                 &config,
                                 authorized_clients.as_deref(),
                                 ipts,
@@ -1551,6 +1599,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                                 &mut rng,
                                 &mut key_rng,
                                 imm.runtime.wallclock(),
+                                max_hsdesc_len,
                             )?
                         };
 
@@ -1690,13 +1739,15 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
                 OwnedCircTarget::from_circ_target(hsdir),
             )
             .await?;
-
+        let source: Option<SourceInfo> = circuit
+            .source_info()
+            .map_err(into_internal!("Couldn't get SourceInfo for circuit"))?;
         let mut stream = circuit
             .begin_dir_stream()
             .await
             .map_err(UploadError::Stream)?;
 
-        let _response: String = send_request(&imm.runtime, &request, &mut stream, None)
+        let _response: String = send_request(&imm.runtime, &request, &mut stream, source)
             .await
             .map_err(|dir_error| -> UploadError {
                 match dir_error {
@@ -1744,8 +1795,25 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             imm.runtime.clone(),
         );
 
-        let fallible_op =
-            || Self::upload_descriptor(hsdesc.clone(), netdir, hsdir, Arc::clone(&imm));
+        let fallible_op = || async {
+            let r = Self::upload_descriptor(hsdesc.clone(), netdir, hsdir, Arc::clone(&imm)).await;
+
+            if let Err(e) = &r {
+                if e.should_report_as_suspicious() {
+                    // Note that not every protocol violation is suspicious:
+                    // we only warn on the protocol violations that look like attempts
+                    // to do a traffic tagging attack via hsdir inflation.
+                    // (See proposal 360.)
+                    warn_report!(
+                        &e.clone(),
+                        "Suspicious error while uploading descriptor to {}/{}",
+                        ed_id,
+                        rsa_id
+                    );
+                }
+            }
+            r
+        };
 
         let outcome: Result<(), BackoffError<UploadError>> = runner.run(fallible_op).await;
         match outcome {

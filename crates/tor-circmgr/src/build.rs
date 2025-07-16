@@ -15,12 +15,10 @@ use std::time::{Duration, Instant};
 use tor_chanmgr::{ChanMgr, ChanProvenance, ChannelUsage};
 use tor_error::into_internal;
 use tor_guardmgr::GuardStatus;
-use tor_linkspec::{ChanTarget, CircTarget, IntoOwnedChanTarget, OwnedChanTarget, OwnedCircTarget};
+use tor_linkspec::{ChanTarget, IntoOwnedChanTarget, OwnedChanTarget, OwnedCircTarget};
 use tor_netdir::params::NetParameters;
 use tor_proto::ccparams::{self, AlgorithmType};
 use tor_proto::circuit::{CircParameters, ClientCirc, PendingClientCirc};
-use tor_protover::named::{FLOWCTRL_CC, RELAY_NTORV3};
-use tor_protover::Protocols;
 use tor_rtcompat::{Runtime, SleepProviderExt};
 use tor_units::Percentage;
 
@@ -155,12 +153,7 @@ impl Buildable for ClientCirc {
         let circ = create_common(chanmgr, rt, ct, guard_status, usage).await?;
         let unique_id = Some(circ.peek_unique_id());
 
-        // The target supports ntor_v3 iff it advertises the relevant protover.
-        let handshake_res = if ct.protovers().supports_named_subver(RELAY_NTORV3) {
-            circ.create_firsthop_ntor_v3(ct, params).await
-        } else {
-            circ.create_firsthop_ntor(ct, params).await
-        };
+        let handshake_res = circ.create_firsthop(ct, params).await;
 
         handshake_res.map_err(|error| Error::Protocol {
             peer: Some(ct.to_logged()),
@@ -175,12 +168,8 @@ impl Buildable for ClientCirc {
         ct: &OwnedCircTarget,
         params: CircParameters,
     ) -> Result<()> {
-        // The target supports ntor_v3 iff it advertises the relevant protover.
-        let res = if ct.protovers().supports_named_subver(RELAY_NTORV3) {
-            self.extend_ntor_v3(ct, params).await
-        } else {
-            self.extend_ntor(ct, params).await
-        };
+        // use "ClientCirc::" name to avoid calling _this_ method.
+        let res = ClientCirc::extend(self, ct, params).await;
 
         res.map_err(|error| Error::Protocol {
             error,
@@ -221,16 +210,6 @@ impl<R: Runtime, C: Buildable + Sync + Send + 'static> Builder<R, C> {
             chanmgr,
             timeouts,
             _phantom: std::marker::PhantomData,
-        }
-    }
-
-    /// Helper function that takes the circuit parameters and apply any changes from the given
-    /// subprotocol versions.
-    fn apply_protovers_to_circparams(params: &mut CircParameters, protocols: &Protocols) {
-        // Not supporting FlowCtrl=2 means we have to use the fallback congestion control algorithm
-        // which is the FixedWindow one.
-        if !protocols.supports_named_subver(FLOWCTRL_CC) {
-            params.ccontrol.use_fallback_alg();
         }
     }
 
@@ -275,14 +254,12 @@ impl<R: Runtime, C: Buildable + Sync + Send + 'static> Builder<R, C> {
                 // If we fail now, it's the guard's fault.
                 guard_status.pending(GuardStatus::Failure);
                 // Each hop has its own circ parameters. This is for the first hop (CREATE).
-                let mut first_hop_params = params.clone();
-                Self::apply_protovers_to_circparams(&mut first_hop_params, p[0].protovers());
                 let circ = C::create(
                     &self.chanmgr,
                     &self.runtime,
                     &guard_status,
                     &p[0],
-                    first_hop_params,
+                    params.clone(),
                     usage,
                 )
                 .await?;
@@ -295,9 +272,7 @@ impl<R: Runtime, C: Buildable + Sync + Send + 'static> Builder<R, C> {
                 let mut hop_num = 1;
                 for relay in p[1..].iter() {
                     // Get the params per subsequent hop (EXTEND).
-                    let mut hop_params = params.clone();
-                    Self::apply_protovers_to_circparams(&mut hop_params, relay.protovers());
-                    circ.extend(&self.runtime, relay, hop_params).await?;
+                    circ.extend(&self.runtime, relay, params.clone()).await?;
                     n_hops_built.fetch_add(1, Ordering::SeqCst);
                     self.timeouts.note_hop_completed(
                         hop_num,
@@ -540,14 +515,18 @@ fn build_cc_vegas(
 
 /// Return the congestion control FixedWindow algorithm using the given network parameters.
 fn build_cc_fixedwindow(inp: &NetParameters) -> ccparams::Algorithm {
-    ccparams::Algorithm::FixedWindow(
-        ccparams::FixedWindowParamsBuilder::default()
-            .circ_window_start(inp.circuit_window.get() as u16)
-            .circ_window_min(inp.circuit_window.lower() as u16)
-            .circ_window_max(inp.circuit_window.upper() as u16)
-            .build()
-            .expect("Unable to build FixedWindow params from NetParams"),
-    )
+    ccparams::Algorithm::FixedWindow(build_cc_fixedwindow_params(inp))
+}
+
+/// Return the parameters for the congestion control FixedWindow algorithm
+/// using the given network parameters.
+fn build_cc_fixedwindow_params(inp: &NetParameters) -> ccparams::FixedWindowParams {
+    ccparams::FixedWindowParamsBuilder::default()
+        .circ_window_start(inp.circuit_window.get() as u16)
+        .circ_window_min(inp.circuit_window.lower() as u16)
+        .circ_window_max(inp.circuit_window.upper() as u16)
+        .build()
+        .expect("Unable to build FixedWindow params from NetParams")
 }
 
 /// Return a new circuit parameter struct using the given network parameters and algorithm to use.
@@ -582,7 +561,7 @@ fn circparameters_from_netparameters(
         .map_err(into_internal!("Unable to build RTT params from NetParams"))?;
     let ccontrol = ccparams::CongestionControlParamsBuilder::default()
         .alg(alg)
-        .fallback_alg(build_cc_fixedwindow(inp))
+        .fixed_window_params(build_cc_fixedwindow_params(inp))
         .cwnd_params(cwnd_params)
         .rtt_params(rtt_params)
         .build()

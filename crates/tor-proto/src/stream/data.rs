@@ -7,8 +7,11 @@ use tor_cell::relaycell::msg::EndReason;
 use tor_cell::relaycell::{RelayCellFormat, RelayCmd};
 
 use futures::io::{AsyncRead, AsyncWrite};
+use futures::stream::StreamExt;
 use futures::task::{Context, Poll};
-use futures::Future;
+use futures::{Future, Stream};
+use pin_project::pin_project;
+use postage::watch;
 
 #[cfg(feature = "tokio")]
 use tokio_crate::io::ReadBuf;
@@ -20,6 +23,7 @@ use tor_cell::restricted_msg;
 
 use std::fmt::Debug;
 use std::io::Result as IoResult;
+use std::num::NonZero;
 use std::pin::Pin;
 #[cfg(any(feature = "stream-ctrl", feature = "experimental-api"))]
 use std::sync::Arc;
@@ -32,13 +36,26 @@ use educe::Educe;
 use crate::tunnel::circuit::ClientCirc;
 
 use crate::memquota::StreamAccount;
-use crate::stream::StreamReader;
+use crate::stream::{StreamRateLimit, StreamReceiver};
 use crate::tunnel::StreamTarget;
+use crate::util::token_bucket::dynamic_writer::DynamicRateLimitedWriter;
+use crate::util::token_bucket::writer::{RateLimitedWriter, RateLimitedWriterConfig};
 use tor_basic_utils::skip_fmt;
 use tor_cell::relaycell::msg::Data;
 use tor_error::internal;
+use tor_rtcompat::{CoarseTimeProvider, DynTimeProvider, SleepProvider};
 
 use super::AnyCmdChecker;
+
+/// A stream of [`RateLimitedWriterConfig`] used to update a [`DynamicRateLimitedWriter`].
+///
+/// Unfortunately we need to store the result of a [`StreamExt::map`] and [`StreamExt::fuse`] in
+/// [`DataWriter`], which leaves us with this ugly type.
+/// We use a type alias to make `DataWriter` a little nicer.
+type RateConfigStream = futures::stream::Map<
+    futures::stream::Fuse<watch::Receiver<StreamRateLimit>>,
+    fn(StreamRateLimit) -> RateLimitedWriterConfig,
+>;
 
 /// An anonymized stream over the Tor network.
 ///
@@ -164,6 +181,31 @@ pub struct ClientDataStreamCtrl {
     _memquota: StreamAccount,
 }
 
+/// The inner writer for [`DataWriter`].
+///
+/// This type is responsible for taking bytes and packaging them into cells.
+/// Rate limiting is implemented in [`DataWriter`] to avoid making this type more complex.
+#[derive(Debug)]
+struct DataWriterInner {
+    /// Internal state for this writer
+    ///
+    /// This is stored in an Option so that we can mutate it in the
+    /// AsyncWrite functions.  It might be possible to do better here,
+    /// and we should refactor if so.
+    state: Option<DataWriterState>,
+
+    /// The memory quota account that should be used for this stream's data
+    ///
+    /// Exists to keep the account alive
+    // If we liked, we could make this conditional; see DataReader.memquota
+    _memquota: StreamAccount,
+
+    /// A control object that can be used to monitor and control this stream
+    /// without needing to own it.
+    #[cfg(feature = "stream-ctrl")]
+    ctrl: std::sync::Arc<ClientDataStreamCtrl>,
+}
+
 /// The write half of a [`DataStream`], implementing [`futures::io::AsyncWrite`].
 ///
 /// See the [`DataStream`] docs for more information. In particular, note
@@ -199,23 +241,91 @@ pub struct ClientDataStreamCtrl {
 // `tor-proto` need to be reflected above.
 #[derive(Debug)]
 pub struct DataWriter {
-    /// Internal state for this writer
-    ///
-    /// This is stored in an Option so that we can mutate it in the
-    /// AsyncWrite functions.  It might be possible to do better here,
-    /// and we should refactor if so.
-    state: Option<DataWriterState>,
+    /// A wrapper around [`DataWriterInner`] that adds rate limiting.
+    writer: DynamicRateLimitedWriter<DataWriterInner, RateConfigStream, DynTimeProvider>,
+}
 
-    /// The memory quota account that should be used for this stream's data
-    ///
-    /// Exists to keep the account alive
-    // If we liked, we could make this conditional; see DataReader.memquota
-    _memquota: StreamAccount,
+impl DataWriter {
+    /// Create a new rate-limited [`DataWriter`] from a [`DataWriterInner`].
+    fn new(
+        inner: DataWriterInner,
+        rate_limit_updates: watch::Receiver<StreamRateLimit>,
+        time_provider: DynTimeProvider,
+    ) -> Self {
+        /// Converts a `rate` into a `RateLimitedWriterConfig`.
+        fn rate_to_config(rate: StreamRateLimit) -> RateLimitedWriterConfig {
+            let rate = rate.bytes_per_sec();
+            RateLimitedWriterConfig {
+                rate,        // bytes per second
+                burst: rate, // bytes
+                // This number is chosen arbitrarily, but the idea is that we want to balance
+                // between throughput and latency. Assume the user tries to write a large buffer
+                // (~600 bytes). If we set this too small (for example 1), we'll be waking up
+                // frequently and writing a small number of bytes each time to the
+                // `DataWriterInner`, even if this isn't enough bytes to send a cell. If we set this
+                // too large (for example 510), we'll be waking up infrequently to write a larger
+                // number of bytes each time. So even if the `DataWriterInner` has almost a full
+                // cell's worth of data queued (for example 490) and only needs 509-490=19 more
+                // bytes before a cell can be sent, it will block until the rate limiter allows 510
+                // more bytes.
+                //
+                // TODO(arti#2028): Is there an optimal value here?
+                wake_when_bytes_available: NonZero::new(200).expect("200 != 0"), // bytes
+            }
+        }
 
-    /// A control object that can be used to monitor and control this stream
-    /// without needing to own it.
+        // get the current rate from the `watch::Receiver`, which we'll use as the initial rate
+        let initial_rate: StreamRateLimit = *rate_limit_updates.borrow();
+
+        // map the rate update stream to the type required by `DynamicRateLimitedWriter`
+        let rate_limit_updates = rate_limit_updates.fuse().map(rate_to_config as fn(_) -> _);
+
+        // build the rate limiter
+        let writer = RateLimitedWriter::new(inner, &rate_to_config(initial_rate), time_provider);
+        let writer = DynamicRateLimitedWriter::new(writer, rate_limit_updates);
+
+        Self { writer }
+    }
+
+    /// Return a [`ClientDataStreamCtrl`] object that can be used to monitor and
+    /// interact with this stream without holding the stream itself.
     #[cfg(feature = "stream-ctrl")]
-    ctrl: std::sync::Arc<ClientDataStreamCtrl>,
+    pub fn client_stream_ctrl(&self) -> Option<&Arc<ClientDataStreamCtrl>> {
+        Some(self.writer.inner().client_stream_ctrl())
+    }
+}
+
+impl AsyncWrite for DataWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<IoResult<usize>> {
+        AsyncWrite::poll_write(Pin::new(&mut self.writer), cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.writer), cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        AsyncWrite::poll_close(Pin::new(&mut self.writer), cx)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl TokioAsyncWrite for DataWriter {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
+        TokioAsyncWrite::poll_write(Pin::new(&mut self.compat_write()), cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        TokioAsyncWrite::poll_flush(Pin::new(&mut self.compat_write()), cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        TokioAsyncWrite::poll_shutdown(Pin::new(&mut self.compat_write()), cx)
+    }
 }
 
 /// The read half of a [`DataStream`], implementing [`futures::io::AsyncRead`].
@@ -344,38 +454,46 @@ impl ClientDataStreamCtrl {
 }
 
 impl DataStream {
-    /// Wrap raw stream reader and target parts as a DataStream.
+    /// Wrap raw stream receiver and target parts as a DataStream.
     ///
     /// For non-optimistic stream, function `wait_for_connection`
     /// must be called after to make sure CONNECTED is received.
-    pub(crate) fn new(reader: StreamReader, target: StreamTarget, memquota: StreamAccount) -> Self {
-        Self::new_inner(reader, target, false, memquota)
+    pub(crate) fn new<P: SleepProvider + CoarseTimeProvider>(
+        time_provider: P,
+        receiver: StreamReceiver,
+        target: StreamTarget,
+        memquota: StreamAccount,
+    ) -> Self {
+        Self::new_inner(time_provider, receiver, target, false, memquota)
     }
 
-    /// Wrap raw stream reader and target parts as a connected DataStream.
+    /// Wrap raw stream receiver and target parts as a connected DataStream.
     ///
     /// Unlike [`DataStream::new`], this creates a `DataStream` that does not expect to receive a
     /// CONNECTED cell.
     ///
     /// This is used by hidden services, exit relays, and directory servers to accept streams.
     #[cfg(feature = "hs-service")]
-    pub(crate) fn new_connected(
-        reader: StreamReader,
+    pub(crate) fn new_connected<P: SleepProvider + CoarseTimeProvider>(
+        time_provider: P,
+        receiver: StreamReceiver,
         target: StreamTarget,
         memquota: StreamAccount,
     ) -> Self {
-        Self::new_inner(reader, target, true, memquota)
+        Self::new_inner(time_provider, receiver, target, true, memquota)
     }
 
     /// The shared implementation of the `new*()` functions.
-    fn new_inner(
-        reader: StreamReader,
+    fn new_inner<P: SleepProvider + CoarseTimeProvider>(
+        time_provider: P,
+        receiver: StreamReceiver,
         target: StreamTarget,
         connected: bool,
         memquota: StreamAccount,
     ) -> Self {
         let relay_cell_format = target.relay_cell_format();
         let out_buf_len = Data::max_body_len(relay_cell_format);
+        let rate_limit_stream = target.rate_limit_stream().clone();
 
         #[cfg(feature = "stream-ctrl")]
         let status = {
@@ -393,8 +511,8 @@ impl DataStream {
             _memquota: memquota.clone(),
         });
         let r = DataReader {
-            state: Some(DataReaderState::Ready(DataReaderImpl {
-                s: reader,
+            state: Some(DataReaderState::Open(DataReaderImpl {
+                s: receiver,
                 pending: Vec::new(),
                 offset: 0,
                 connected,
@@ -405,7 +523,7 @@ impl DataStream {
             #[cfg(feature = "stream-ctrl")]
             ctrl: ctrl.clone(),
         };
-        let w = DataWriter {
+        let w = DataWriterInner {
             state: Some(DataWriterState::Ready(DataWriterImpl {
                 s: target,
                 buf: vec![0; out_buf_len].into_boxed_slice(),
@@ -418,8 +536,11 @@ impl DataStream {
             #[cfg(feature = "stream-ctrl")]
             ctrl: ctrl.clone(),
         };
+
+        let time_provider = DynTimeProvider::new(time_provider);
+
         DataStream {
-            w,
+            w: DataWriter::new(w, rate_limit_stream, time_provider),
             r,
             #[cfg(feature = "stream-ctrl")]
             ctrl,
@@ -439,16 +560,16 @@ impl DataStream {
         // We must put state back before returning
         let state = self.r.state.take().expect("Missing state in DataReader");
 
-        if let DataReaderState::Ready(imp) = state {
-            let (imp, result) = if imp.connected {
-                (imp, Ok(()))
+        if let DataReaderState::Open(mut imp) = state {
+            let result = if imp.connected {
+                Ok(())
             } else {
                 // This succeeds if the cell is CONNECTED, and fails otherwise.
-                imp.read_cell().await
+                std::future::poll_fn(|cx| Pin::new(&mut imp).read_cell(cx)).await
             };
             self.r.state = Some(match result {
                 Err(_) => DataReaderState::Closed,
-                Ok(_) => DataReaderState::Ready(imp),
+                Ok(_) => DataReaderState::Open(imp),
             });
             result
         } else {
@@ -572,12 +693,11 @@ struct DataWriterImpl {
     status: Arc<Mutex<DataStreamStatus>>,
 }
 
-impl DataWriter {
-    /// Return a [`ClientDataStreamCtrl`] object that can be used to monitor and
-    /// interact with this stream without holding the stream itself.
+impl DataWriterInner {
+    /// See [`DataWriter::client_stream_ctrl`].
     #[cfg(feature = "stream-ctrl")]
-    pub fn client_stream_ctrl(&self) -> Option<&Arc<ClientDataStreamCtrl>> {
-        Some(&self.ctrl)
+    fn client_stream_ctrl(&self) -> &Arc<ClientDataStreamCtrl> {
+        &self.ctrl
     }
 
     /// Helper for poll_flush() and poll_close(): Performs a flush, then
@@ -625,7 +745,7 @@ impl DataWriter {
                     // Tell the StreamTarget to close, so that the reactor
                     // realizes that we are done sending. (Dropping `imp.s` does not
                     // suffice, since there may be other clones of it.  In particular,
-                    // the StreamReader has one, which it uses to keep the stream
+                    // the StreamReceiver has one, which it uses to keep the stream
                     // open, among other things.)
                     imp.s.close();
 
@@ -650,7 +770,7 @@ impl DataWriter {
     }
 }
 
-impl AsyncWrite for DataWriter {
+impl AsyncWrite for DataWriterInner {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -712,7 +832,7 @@ impl AsyncWrite for DataWriter {
 }
 
 #[cfg(feature = "tokio")]
-impl TokioAsyncWrite for DataWriter {
+impl TokioAsyncWrite for DataWriterInner {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResult<usize>> {
         TokioAsyncWrite::poll_write(Pin::new(&mut self.compat_write()), cx, buf)
     }
@@ -769,36 +889,28 @@ impl DataReader {
     }
 }
 
-/// An enumeration for the state of a DataReader.
-///
-/// We have to use an enum here because, when we're waiting for
-/// ReadingCell to complete, the future returned by `read_cell()` owns the
-/// DataCellImpl.  If we wanted to store the future and the cell at the
-/// same time, we'd need to make a self-referential structure, which isn't
-/// possible in safe Rust AIUI.
+/// An enumeration for the state of a [`DataReader`].
+// TODO: We don't need to implement the state in this way anymore now that we've removed the saved
+// future. There are a few ways we could simplify this. See:
+// https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/3076#note_3218210
 #[derive(Educe)]
 #[educe(Debug)]
 enum DataReaderState {
     /// In this state we have received an end cell or an error.
     Closed,
-    /// In this state the reader is not currently fetching a cell; it
-    /// either has data or not.
-    Ready(DataReaderImpl),
-    /// The reader is currently fetching a cell: this future is the
-    /// progress it is making.
-    ReadingCell(
-        #[educe(Debug(method = "skip_fmt"))] //
-        BoxSyncFuture<'static, (DataReaderImpl, Result<()>)>,
-    ),
+    /// In this state the reader is open.
+    Open(DataReaderImpl),
 }
 
-/// Wrapper for the read part of a DataStream
+/// Wrapper for the read part of a [`DataStream`].
 #[derive(Educe)]
 #[educe(Debug)]
+#[pin_project]
 struct DataReaderImpl {
-    /// The underlying StreamReader object.
+    /// The underlying StreamReceiver object.
     #[educe(Debug(method = "skip_fmt"))]
-    s: StreamReader,
+    #[pin]
+    s: StreamReceiver,
 
     /// If present, data that we received on this stream but have not
     /// been able to send to the caller yet.
@@ -829,36 +941,36 @@ impl AsyncRead for DataReader {
         let mut state = self.state.take().expect("Missing state in DataReader");
 
         loop {
-            let mut future = match state {
-                DataReaderState::Ready(mut imp) => {
+            let mut imp = match state {
+                DataReaderState::Open(mut imp) => {
                     // There may be data to read already.
                     let n_copied = imp.extract_bytes(buf);
-                    if n_copied != 0 {
-                        // We read data into the buffer.  Tell the caller.
-                        self.state = Some(DataReaderState::Ready(imp));
+                    if n_copied != 0 || buf.is_empty() {
+                        // We read data into the buffer, or the buffer was 0-len to begin with.
+                        // Tell the caller.
+                        self.state = Some(DataReaderState::Open(imp));
                         return Poll::Ready(Ok(n_copied));
                     }
 
-                    // No data available!  We have to launch a read.
-                    Box::pin(imp.read_cell())
+                    // No data available!  We have to try reading.
+                    imp
                 }
-                DataReaderState::ReadingCell(fut) => fut,
                 DataReaderState::Closed => {
+                    // TODO: Why are we returning an error rather than continuing to return EOF?
                     self.state = Some(DataReaderState::Closed);
                     return Poll::Ready(Err(Error::NotConnected.into()));
                 }
             };
 
-            // We have a future that represents an in-progress read.
-            // See if it can make progress.
-            match future.as_mut().poll(cx) {
-                Poll::Ready((_imp, Err(e))) => {
+            // See if a cell is ready.
+            match Pin::new(&mut imp).read_cell(cx) {
+                Poll::Ready(Err(e)) => {
                     // There aren't any survivable errors in the current
                     // design.
                     self.state = Some(DataReaderState::Closed);
                     #[cfg(feature = "stream-ctrl")]
                     {
-                        _imp.status.lock().expect("lock poisoned").record_error(&e);
+                        imp.status.lock().expect("lock poisoned").record_error(&e);
                     }
                     let result = if matches!(e, Error::EndReceived(EndReason::DONE)) {
                         Ok(0)
@@ -867,14 +979,14 @@ impl AsyncRead for DataReader {
                     };
                     return Poll::Ready(result);
                 }
-                Poll::Ready((imp, Ok(()))) => {
+                Poll::Ready(Ok(())) => {
                     // It read a cell!  Continue the loop.
-                    state = DataReaderState::Ready(imp);
+                    state = DataReaderState::Open(imp);
                 }
                 Poll::Pending => {
-                    // The future is pending; store it and tell the
+                    // No cells ready, so tell the
                     // caller to get back to us later.
-                    self.state = Some(DataReaderState::ReadingCell(future));
+                    self.state = Some(DataReaderState::Open(imp));
                     return Poll::Pending;
                 }
             }
@@ -911,23 +1023,24 @@ impl DataReaderImpl {
     }
 
     /// Load self.pending with the contents of a new data cell.
-    ///
-    /// This function takes ownership of self so that we can avoid
-    /// self-referential lifetimes.
-    async fn read_cell(mut self) -> (Self, Result<()>) {
+    fn read_cell(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         use DataStreamMsg::*;
-        let msg = match self.s.recv().await {
-            Ok(unparsed) => match unparsed.decode::<DataStreamMsg>() {
+        let msg = match self.as_mut().project().s.poll_next(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Some(Ok(unparsed))) => match unparsed.decode::<DataStreamMsg>() {
                 Ok(cell) => cell.into_msg(),
                 Err(e) => {
                     self.s.protocol_error();
-                    return (
-                        self,
-                        Err(Error::from_bytes_err(e, "message on a data stream")),
-                    );
+                    return Poll::Ready(Err(Error::from_bytes_err(e, "message on a data stream")));
                 }
             },
-            Err(e) => return (self, Err(e)),
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+            // TODO: This doesn't seem right to me, but seems to be the behaviour of the code before
+            // the refactoring, so I've kept the same behaviour. I think if the cell stream is
+            // terminated, we should be returning `None` here and not considering it as an error.
+            // The `StreamReceiver` will have already returned an error if the cell stream was
+            // terminated without an END message.
+            Poll::Ready(None) => return Poll::Ready(Err(Error::NotConnected)),
         };
 
         let result = match msg {
@@ -961,7 +1074,7 @@ impl DataReaderImpl {
             End(e) => Err(Error::EndReceived(e.reason())),
         };
 
-        (self, result)
+        Poll::Ready(result)
     }
 
     /// Add the data from `d` to the end of our pending bytes.

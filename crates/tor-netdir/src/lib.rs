@@ -450,7 +450,7 @@ pub(crate) struct HsDirs<D> {
     /// secondary rings will be active at a time.  We have two here in order
     /// to conform with a more flexible regime in proposal 342.
     //
-    // TODO: hs clients never need this; so I've made it not-present for thm.
+    // TODO: hs clients never need this; so I've made it not-present for them.
     // But does that risk too much with respect to side channels?
     //
     // TODO: Perhaps we should refactor this so that it is clear that these
@@ -1424,6 +1424,16 @@ impl NetDir {
         self.consensus.relay_protocol_status()
     }
 
+    /// Return a [`ProtoStatus`](netstatus::ProtoStatus) that lists the
+    /// network's current requirements and recommendations for the list of
+    /// protocols that every relay must implement.
+    //
+    // TODO HS: See notes on relay_protocol_status above.
+    #[cfg(feature = "hs-common")]
+    pub fn client_protocol_status(&self) -> &netstatus::ProtoStatus {
+        self.consensus.client_protocol_status()
+    }
+
     /// Return weighted the fraction of relays we can use.  We only
     /// consider relays that match the predicate `usable`.  We weight
     /// this bandwidth according to the provided `role`.
@@ -1632,10 +1642,11 @@ impl NetDir {
             }
             Ok(iter) => {
                 let selection: Vec<_> = iter.map(Relay::clone).collect();
-                if selection.len() < n {
+                if selection.len() < n && selection.len() < relays.len() {
                     warn!(?self.weights, ?role,
-                          "After filtering, choose_multiple_weighted only returned {}/{} relays with nonzero weight. See bug #1907.",
-                          selection.len(), relays.len());
+                          "choose_multiple_weighted returned only {returned}, despite requesting {n}, \
+                          and having {filtered_len} available after filtering. See bug #1907.",
+                          returned=selection.len(), filtered_len=relays.len());
                 }
                 selection
             }

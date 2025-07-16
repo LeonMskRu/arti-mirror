@@ -8,37 +8,89 @@ pub(crate) mod msghandler;
 pub(crate) mod reactor;
 mod streammap;
 
+use derive_deftly::Deftly;
+use derive_more::Display;
 use futures::SinkExt as _;
 use oneshot_fused_workaround as oneshot;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::circuit::UniqId;
 use crate::crypto::cell::HopNum;
+use crate::stream::StreamRateLimit;
 use crate::{Error, Result};
 use circuit::ClientCirc;
 use circuit::{handshake, StreamMpscSender};
-use reactor::{CtrlMsg, LegId};
+use reactor::CtrlMsg;
 
+use postage::watch;
 use tor_async_utils::SinkCloseChannel as _;
 use tor_cell::relaycell::msg::AnyRelayMsg;
 use tor_cell::relaycell::{RelayCellFormat, StreamId};
+use tor_memquota::derive_deftly_template_HasMemoryCost;
 
-// TODO(#1857): Make this pub and not `allow(dead_code)`.
+/// The unique identifier of a tunnel.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display)]
+#[display("{}", _0)]
+pub(crate) struct TunnelId(u64);
+
+impl TunnelId {
+    /// Create a new TunnelId.
+    ///
+    /// # Panics
+    ///
+    /// Panics if we have exhausted the possible space of u64 IDs.
+    pub(crate) fn next() -> TunnelId {
+        /// The next unique tunnel ID.
+        static NEXT_TUNNEL_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_TUNNEL_ID.fetch_add(1, Ordering::Relaxed);
+        assert!(id != 0, "Exhausted Tunnel ID space?!");
+        TunnelId(id)
+    }
+}
+
+/// The identifier of a circuit [`UniqId`] within a tunnel.
+///
+/// This type is only needed for logging purposes: a circuit's [`UniqId`] is
+/// process-unique, but in the logs it's often useful to display the
+/// owning tunnel's ID alongside the circuit identifier.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Display)]
+#[display("Circ {}.{}", tunnel_id, circ_id.display_chan_circ())]
+pub(crate) struct TunnelScopedCircId {
+    /// The identifier of the owning tunnel
+    tunnel_id: TunnelId,
+    /// The process-unique identifier of the circuit
+    circ_id: UniqId,
+}
+
+impl TunnelScopedCircId {
+    /// Create a new [`TunnelScopedCircId`] from the specified identifiers.
+    pub(crate) fn new(tunnel_id: TunnelId, circ_id: UniqId) -> Self {
+        Self { tunnel_id, circ_id }
+    }
+
+    /// Return the [`UniqId`].
+    pub(crate) fn unique_id(&self) -> UniqId {
+        self.circ_id
+    }
+}
+
 /// A precise position in a tunnel.
-#[allow(dead_code)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum HopLocation {
+#[derive(Debug, Deftly, Copy, Clone, PartialEq, Eq)]
+#[derive_deftly(HasMemoryCost)]
+#[non_exhaustive]
+pub enum HopLocation {
     /// A specific position in a tunnel.
-    Hop((LegId, HopNum)),
+    Hop((UniqId, HopNum)),
     /// The join point of a multi-path tunnel.
     JoinPoint,
 }
 
-// TODO(#1857): Make this pub and not `allow(dead_code)`.
 /// A position in a tunnel.
-#[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum TargetHop {
+#[non_exhaustive]
+pub enum TargetHop {
     /// A specific position in a tunnel.
     Hop(HopLocation),
     /// The last hop of a tunnel.
@@ -47,6 +99,28 @@ pub(crate) enum TargetHop {
     /// Some tunnels may be extended or truncated,
     /// which means that the "last hop" may change at any time.
     LastHop,
+}
+
+impl From<(UniqId, HopNum)> for HopLocation {
+    fn from(v: (UniqId, HopNum)) -> Self {
+        HopLocation::Hop(v)
+    }
+}
+
+impl From<(UniqId, HopNum)> for TargetHop {
+    fn from(v: (UniqId, HopNum)) -> Self {
+        TargetHop::Hop(v.into())
+    }
+}
+
+impl HopLocation {
+    /// Return the hop number if not a JointPoint.
+    pub fn hop_num(&self) -> Option<HopNum> {
+        match self {
+            Self::Hop((_, hop_num)) => Some(*hop_num),
+            Self::JoinPoint => None,
+        }
+    }
 }
 
 /// Internal handle, used to implement a stream on a particular circuit.
@@ -70,6 +144,9 @@ pub(crate) struct StreamTarget {
     /// This is mostly irrelevant, except when deciding
     /// how many bytes we can pack in a DATA message.
     relay_cell_format: RelayCellFormat,
+    /// A [`Stream`](futures::Stream) that provides updates to the rate limit for sending data.
+    // TODO(arti#2068): we should consider making this an `Option`
+    rate_limit_stream: watch::Receiver<StreamRateLimit>,
     /// Channel to send cells down.
     tx: StreamMpscSender<AnyRelayMsg>,
     /// Reference to the circuit that this stream is on.
@@ -155,20 +232,21 @@ impl StreamTarget {
         self.circ.protocol_error();
     }
 
-    /// Send a SENDME cell for this stream.
-    pub(crate) async fn send_sendme(&mut self) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-
+    /// Request to send a SENDME cell for this stream.
+    ///
+    /// This sends a request to the circuit reactor to send a stream-level SENDME, but it does not
+    /// block or wait for a response from the circuit reactor.
+    /// An error is only returned if we are unable to send the request.
+    /// This means that if the circuit reactor is unable to send the SENDME, we are not notified of
+    /// this here and an error will not be returned.
+    pub(crate) fn send_sendme(&mut self) -> Result<()> {
         self.circ
             .control
             .unbounded_send(CtrlMsg::SendSendme {
                 stream_id: self.stream_id,
                 hop: self.hop,
-                sender: tx,
             })
-            .map_err(|_| Error::CircuitClosed)?;
-
-        rx.await.map_err(|_| Error::CircuitClosed)?
+            .map_err(|_| Error::CircuitClosed)
     }
 
     /// Return a reference to the circuit that this `StreamTarget` is using.
@@ -180,5 +258,10 @@ impl StreamTarget {
     /// Return the kind of relay cell in use on this `StreamTarget`.
     pub(crate) fn relay_cell_format(&self) -> RelayCellFormat {
         self.relay_cell_format
+    }
+
+    /// A [`Stream`](futures::Stream) that provides updates to the rate limit for sending data.
+    pub(crate) fn rate_limit_stream(&self) -> &watch::Receiver<StreamRateLimit> {
+        &self.rate_limit_stream
     }
 }

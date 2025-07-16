@@ -132,6 +132,13 @@ pub enum Error {
     #[error("Stream protocol violation: {0}")]
     StreamProto(String),
 
+    /// Excessive data received from a circuit hop.
+    #[error("Received too many inbound cells")]
+    ExcessInboundCells,
+    /// Tried to send too many cells to a circuit hop.
+    #[error("Tried to send too many outbound cells")]
+    ExcessOutboundCells,
+
     /// Channel does not match target
     #[error("Peer identity mismatch: {0}")]
     ChanMismatch(String),
@@ -241,7 +248,9 @@ impl From<Error> for std::io::Error {
             | StreamProto(_)
             | MissingId(_)
             | IdUnavailable(_)
-            | StreamIdZero => ErrorKind::InvalidData,
+            | StreamIdZero
+            | ExcessInboundCells
+            | ExcessOutboundCells => ErrorKind::InvalidData,
 
             Bug(ref e) if e.kind() == tor_error::ErrorKind::BadApiUsage => ErrorKind::InvalidData,
 
@@ -291,6 +300,8 @@ impl HasKind for Error {
             E::MissingId(_) => EK::BadApiUsage,
             E::IdUnavailable(_) => EK::BadApiUsage,
             E::StreamIdZero => EK::BadApiUsage,
+            E::ExcessInboundCells => EK::TorProtocolViolation,
+            E::ExcessOutboundCells => EK::Internal,
             E::Memquota(err) => err.kind(),
             E::Bug(e) => e.kind(),
         }
@@ -334,4 +345,17 @@ impl ReactorError {
             ReactorError::Err(e) => e,
         }
     }
+}
+
+/// An error type for client-side conflux handshakes.
+#[derive(Debug)]
+#[cfg(feature = "conflux")]
+#[allow(unused)] // TODO(conflux): remove
+pub(crate) enum ConfluxHandshakeError {
+    /// Timeout while waiting for CONFLUX_LINKED response.
+    Timeout,
+    /// An error that occurred while sending the CONFLUX_LINK message.
+    Link(Error),
+    /// The channel was closed.
+    ChannelClosed,
 }

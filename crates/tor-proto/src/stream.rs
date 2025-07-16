@@ -32,7 +32,7 @@ pub use incoming::{
     IncomingStreamRequestDisposition, IncomingStreamRequestFilter,
 };
 pub use params::StreamParameters;
-pub use raw::StreamReader;
+pub use raw::StreamReceiver;
 pub use resolve::ResolveStream;
 pub(crate) use {data::DataCmdChecker, resolve::ResolveCmdChecker};
 
@@ -42,4 +42,4 @@ pub use tor_cell::relaycell::msg::IpVersionPreference;
 #[cfg_attr(docsrs, doc(cfg(feature = "stream-ctrl")))]
 pub use {ctrl::ClientStreamCtrl, data::ClientDataStreamCtrl};
 
-pub(crate) use flow_control::StreamSendFlowControl;
+pub(crate) use flow_control::{StreamRateLimit, StreamSendFlowControl};

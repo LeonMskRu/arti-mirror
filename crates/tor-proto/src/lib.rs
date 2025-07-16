@@ -4,6 +4,9 @@
 
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
+// TODO #2010: Remove this global allow, and either propagate it to the functions that need it,
+// or make those functions less complex.
+#![allow(clippy::cognitive_complexity)]
 // TODO #1645 (either remove this, or decide to have it everywhere)
 #![cfg_attr(
     not(all(feature = "full", feature = "experimental")),
@@ -26,7 +29,7 @@ pub use util::skew::ClockSkew;
 pub use channel::params::ChannelPaddingInstructions;
 pub use congestion::params as ccparams;
 pub use crypto::cell::{HopNum, HopNumDisplay};
-pub use tunnel::circuit;
+pub use tunnel::{circuit, HopLocation, TargetHop};
 
 /// A Result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;

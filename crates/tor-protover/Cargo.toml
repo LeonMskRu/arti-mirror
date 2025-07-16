@@ -1,9 +1,9 @@
 [package]
 name = "tor-protover"
-version = "0.29.0"
+version = "0.32.0"
 authors = ["The Tor Project, Inc.", "Nick Mathewson <nickm@torproject.org>"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.83"
 license = "MIT OR Apache-2.0"
 homepage = "https://gitlab.torproject.org/tpo/core/arti/-/wikis/home"
 description = "Implementation for Tor's subprotocol versioning"
@@ -15,15 +15,17 @@ repository = "https://gitlab.torproject.org/tpo/core/arti.git/"
     workspace = true
 
 [dependencies]
-caret = { path = "../caret", version = "0.5.0" }
+caret = { path = "../caret", version = "0.5.3" }
 paste = "1"
 serde_with = { version = "3.0.0", optional = true }
 thiserror = "2"
+tor-bytes = { path = "../tor-bytes", version = "0.32.0", optional = true }
 
 [features]
 default = []
-full = ["caret/full", "serde"]
+full = ["caret/full", "serde", "tor-bytes", "tor-bytes?/full"]
 serde = ["serde_with"]
+tor-bytes = ["dep:tor-bytes"]
 
 [package.metadata.docs.rs]
 all-features = true
