@@ -65,7 +65,18 @@ level a single call will be sufficient to obtain the result. This will abstract 
 migrate logic as much as possible from `arti::subcommands::hss`.
 The method will have signature:
 ```rust
-fn migrate(&self, to: KeystoreId, from: KeystoreId) -> tor_keymgr::Result<()>
+fn migrate(&self, config: KeystoreMigrationConfig) -> tor_keymgr::Result<()>
+```
+
+Where `KeystoreMigrationConfig` is a wrapper around the two pertinent `KeystoreId`s:
+
+```rust
+KeystoreMigrationConfig
+{
+    to: KeytoreId,
+    from: KeystoreId,
+    /* ... */
+}
 ```
 
 Some issues could arise during the removal phase, as the components currently available
