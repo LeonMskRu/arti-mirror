@@ -22,10 +22,15 @@ Where `CTOR_KEYSTORE_ID` is the keystore ID of the C Tor keystore to migrate, as
 configured in the `<ARTI_CONFIG>`, under the `[storage.keystore.ctor.services.<HS_NICK>]`
 section.
 
-`<TARGET_KEYSTORE_ID>` could represent either a configured or a non-configured keystore.
-If the keystore doesn't exist, a new one could be created. In that case, the output would
-provide instructions on how to include it in the configuration file, such as: `Add this
-line to your configuration file: <LINE>`.
+`<TARGET_KEYSTORE_ID>` should be the keystore ID of one of the keystores configured
+in Arti's TOML config. By default, `TARGET_KEYSTORE_ID` is set to `arti` (Arti's default,
+native primary keystore). If the user specifies a keystore ID not associated with
+any of the configured keystores, the output will provide instructions on how to include
+it in the configuration file, such as: `Add this line to your configuration file: <LINE>`.
+
+> Note: the keystore ID of Arti's primary keystore is currently hard-coded to "arti",
+and is not configurable (#1106). Until #1106 is addressed, users won't have any use
+for the `--to` flag (it only exists for future-proofing reasons)
 
 If the keystore already exists, its behavior could be controlled by an additional flag:
 `force`/`batch`. This would determine whether the existing keys should be overwritten.
