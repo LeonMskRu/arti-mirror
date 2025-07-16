@@ -30,11 +30,20 @@ it in the configuration file, such as: `Add this line to your configuration file
 
 > Note: the keystore ID of Arti's primary keystore is currently hard-coded to "arti",
 and is not configurable (#1106). Until #1106 is addressed, users won't have any use
-for the `--to` flag (it only exists for future-proofing reasons)
+for the `--to` flag (it only exists for future-proofing reasons).
 
-If the keystore already exists, its behavior could be controlled by an additional flag:
-`force`/`batch`. This would determine whether the existing keys should be overwritten.
+The migration tool will conduct a preliminary check to ensure the keys being migrated
+don’t already have a corresponding entry in the target. If any do, the migration will
+be aborted. This behavior could be controlled by an additional flag: `force`/`batch`.
+This would determine whether the existing keys should be overwritten.
 An alternative solution could be to prompt the operator.
+
+The migration should only be executed when both the C Tor service the keys originated
+from and the target arti service are not running.
+
+If a TOCTOU race occurs, meaning one of the C Tor keys we’re migrating disappears or
+another process writes one of the corresponding keys in the Arti keystore (and our
+preliminary check has passed), the migration will be aborted.
 
 The default behavior may be to remove the CTor keystore once the migration is complete,
 in order to avoid key duplication. Alternatively, it could leave the CTor keystore
