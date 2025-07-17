@@ -58,6 +58,25 @@ produce an error and will not proceed with the action if an invalid key is
 encountered.
 
 
+### Procedure
+
+A rough sketch of the steps required for the migration:
+
+* Check that CTor keystore exists
+* Validate validity of the content of the keystore
+* Read keys from CTor keystore (for the time being, just the identity key)
+* Do internal conversion of key formats
+* Check that Arti keystore exists
+    - if so, check if keys related to the migration already exist
+        - if so, check whether the keys are the same as the CTor ones
+            - if so, report that migration is already done
+            - else, if `force` flag is not enabled, abort
+    - else, create new keystore
+* (Over)write keys to Arti keystore
+* (Eventually) delete old CTor keys
+* Report success and exit
+
+
 ### Implemantation Detail
 
 A specialized `KeyMgr` method should be added, so that at the `arti::subcommands::hss`
