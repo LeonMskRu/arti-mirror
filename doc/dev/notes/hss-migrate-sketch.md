@@ -51,7 +51,7 @@ again, and a message such as "already migrated" will be displayed.
 
 The default behavior will be to leave the original CTor keystore intact, this will
 also facilitate an eventual backward migration. This behavior could be changed
-unsing a flag.
+unsing a flag (say, `move`).
 
 The keys in the CTor keystore are expected to be valid. Therefore, the command will
 produce an error and will not proceed with the action if an invalid key is
@@ -79,12 +79,13 @@ KeystoreMigrationConfig
 }
 ```
 
-Some issues could arise during the removal phase, as the components currently available
-to remove the keys do not work with the CTor keystore (`Keystore::remove_unchecked`).
-The existing interface could be modified to achieve the desired result; in that case,
-`arti keys-raw remove-by-id` would need slight reworking, or a new interface could be
-added: `Keystore::remove_ctor_entry`, this could returned the removed entry, given
-that the keys in the CTor keystore are supposed to be valid.
+Some issues could arise during the removal phase (if the `move` flag is enabled),
+as the components currently available to remove the keys do not work with the CTor
+keystore (`Keystore::remove_unchecked`). The existing interface could be modified
+to achieve the desired result; in that case, `arti keys-raw remove-by-id` would
+need slight reworking, or a new interface could be added: `Keystore::remove_ctor_entry`,
+this could returned the removed entry, given that the keys in the CTor keystore
+are supposed to be valid.
 
 
 ### Notes
