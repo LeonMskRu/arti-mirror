@@ -29,14 +29,20 @@ any of the configured keystores, the output will provide instructions on how to 
 it in the configuration file, such as: `Add this line to your configuration file: <LINE>`.
 
 > Note: the keystore ID of Arti's primary keystore is currently hard-coded to "arti",
-and is not configurable (#1106). Until #1106 is addressed, users won't have any use
-for the `--to` flag (it only exists for future-proofing reasons).
+> and is not configurable (#1106). Until #1106 is addressed, users won't have any use
+> for the `--to` flag (it only exists for future-proofing reasons).
 
 The migration tool will conduct a preliminary check to ensure the keys being migrated
 don’t already have a corresponding entry in the target. If any do, the migration will
 be aborted. This behavior could be controlled by an additional flag: `force`/`batch`.
 This would determine whether the existing keys should be overwritten.
 An alternative solution could be to prompt the operator.
+
+> Note: currently, only the identity key will migrate. Because of this, this issue
+> should be taken into account: [\#2065](https://gitlab.torproject.org/tpo/core/arti/-/issues/2065).
+> In order to mitigate \#2065, if the `force` flag is passed and an identity key
+> is encountered in the Arti keystore, the blind keys will be deleted after the
+> identity key is overwritten. This behavior may change in the future.
 
 The migration should only be executed when both the CTor service the keys originated
 from and the target arti service are not running.
