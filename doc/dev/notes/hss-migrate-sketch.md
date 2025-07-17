@@ -41,8 +41,8 @@ An alternative solution could be to prompt the operator.
 > Note: currently, only the identity key will migrate. Because of this, this issue
 > should be taken into account: [\#2065](https://gitlab.torproject.org/tpo/core/arti/-/issues/2065).
 > In order to mitigate \#2065, if the `force` flag is passed and an identity key
-> is encountered in the Arti keystore, the blind keys will be deleted after the
-> identity key is overwritten. This behavior may change in the future.
+> is encountered in the Arti keystore, the blinded/signing keys will be deleted
+> after the identity key is overwritten. This behavior may change in the future.
 
 The migration should only be executed when both the CTor service the keys originated
 from and the target arti service are not running.
