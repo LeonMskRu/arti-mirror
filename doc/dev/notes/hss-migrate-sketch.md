@@ -51,7 +51,7 @@ again, and a message such as "already migrated" will be displayed.
 
 The default behavior will be to leave the original CTor keystore intact, this will
 also facilitate an eventual backward migration. This behavior could be changed
-unsing a flag (say, `move`).
+using a flag (say, `move`).
 
 The keys in the CTor keystore are expected to be valid. Therefore, the command will
 produce an error and will not proceed with the action if an invalid key is
