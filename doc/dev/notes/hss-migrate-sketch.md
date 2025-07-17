@@ -38,7 +38,7 @@ be aborted. This behavior could be controlled by an additional flag: `force`/`ba
 This would determine whether the existing keys should be overwritten.
 An alternative solution could be to prompt the operator.
 
-The migration should only be executed when both the C Tor service the keys originated
+The migration should only be executed when both the CTor service the keys originated
 from and the target arti service are not running.
 
 If a TOCTOU race occurs, meaning one of the C Tor keys we’re migrating disappears or
@@ -63,7 +63,7 @@ encountered.
 A rough sketch of the steps required for the migration:
 
 * Check that CTor keystore exists
-* Validate validity of the content of the keystore
+* Validate the content of the keystore
 * Read keys from CTor keystore (for the time being, just the identity key)
 * Do internal conversion of key formats
 * Check that Arti keystore exists
