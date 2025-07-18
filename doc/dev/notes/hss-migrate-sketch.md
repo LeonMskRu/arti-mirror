@@ -14,7 +14,6 @@ vice versa).
 The command will be:
 ```bash
 arti hss ctor-migrate --config <ARTI_CONFIG> \
-    --nickname <HS_NICK> \
     --from <CTOR_KEYSTORE_ID> \
     [--to <TARGET_KEYSTORE_ID>]
 ```
