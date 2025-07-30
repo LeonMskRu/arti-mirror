@@ -230,7 +230,7 @@ rust-recent:
   artifacts:
     paths:
       - artifacts
-    expire_in: 1 hours
+    expire_in: 1 day
 
 rust-latest:
   stage: test
@@ -275,7 +275,7 @@ rust-recent-arti-extra-features:
   artifacts:
     paths:
       - artifacts
-    expire_in: 1 hours
+    expire_in: 1 day
 
 rust-latest-arti-extra-features:
   stage: test
@@ -678,8 +678,8 @@ every-crate:
   image: $RECENT_RUST_IMAGE
   needs: ["rust-checks", "rust-recent-async-std-rustls"]
   script:
-    - maint/common/apt-install python3-toml
-    - ./maint/every-crate
+    - maint/common/apt-install python3-toml parallel
+    - ./maint/every-crate 5
 
 matrix-check:
   stage: test
