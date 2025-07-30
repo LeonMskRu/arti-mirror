@@ -20,4 +20,4 @@ test_crate () {
 
 export -f test_crate
 
-./maint/list_crates --all | parallel --jobs $1 -N1 -m test_crate
+./maint/list_crates --all | parallel --jobs "$1" -N1 -m test_crate
