@@ -11,9 +11,13 @@ x () {
     "$@"
 }
 
-for crate in $(maint/list_crates --all); do
-    echo ==================== "$crate" ====================
-    # allow $CARGO to contain multiple words
-    # shellcheck disable=SC2086
-    x $CARGO test -p "$crate" --all-targets
-done
+export -f x
+
+test_crate () {
+    echo ==================== "$1" ====================
+    x cargo test -p "$1" --all-targets 
+}
+
+export -f test_crate
+
+./maint/list_crates --all | parallel --jobs $1 -N1 -m test_crate
