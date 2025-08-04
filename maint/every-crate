@@ -22,7 +22,7 @@ while getopts ${OPTS} opt; do
                     echo "Argument of -c must be a non-negative integer."
                     exit 1
             else 
-                CHUNK_N=$((CHUNK_N+${OPTARG}))
+                CHUNK_N=$(( CHUNK_N+OPTARG ))
             fi
             ;;
         n)
@@ -55,7 +55,7 @@ x () {
     "$@"
 }
 
-for i in `seq $CHUNK_N $NUM_CHUNKS $NUM_CRATES`; do
+for i in $(seq "$CHUNK_N" "$NUM_CHUNKS" "$NUM_CRATES"); do
     echo ==================== "${CRATES[i]}" ====================
     # allow $CARGO to contain multiple words
     # shellcheck disable=SC20086
