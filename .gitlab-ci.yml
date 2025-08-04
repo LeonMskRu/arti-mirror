@@ -679,7 +679,15 @@ every-crate:
   needs: ["rust-checks", "rust-recent-async-std-rustls"]
   script:
     - maint/common/apt-install python3-toml parallel
-    - ./maint/every-crate 5
+    - ./maint/every-crate --parallel 5 $PARALLEL_N
+  parallel:
+    matrix:
+      - PARALLEL_N:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
 
 matrix-check:
   stage: test
