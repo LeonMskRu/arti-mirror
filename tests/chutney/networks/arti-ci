@@ -1,5 +1,11 @@
 # This is a network definition for use with chutney.
 
+import os
+
+# Secondary arti binary with extra features. In particular, needs features:
+# * onion-service-service
+arti_extra=os.getenv("NETWORK_ARTI_CI_ARTI_EXTRA_BIN") or os.getenv("CHUTNEY_ARTI") or "arti"
+
 ConfigureNodes(
     # Authorities
     Node(tag="a", authority=1, relay=1).getN(4)
@@ -18,4 +24,9 @@ ConfigureNodes(
     + Node(tag="br", bridge=1, relay=1).getN(1)
     # arti bridge client
     + Node(tag="bc", client=1, backend=NodeBackend.ARTI, bridgeclient=1).getN(1)
+
+    # arti hs
+    + Node(tag="ha", client=1, hs=1, backend=NodeBackend.ARTI, arti=arti_extra).getN(1)
+    # tor hs
+    + Node(tag="ht", client=1, hs=1, backend=NodeBackend.TOR).getN(1)
 )
