@@ -11,6 +11,9 @@ keywords = ["tor", "arti"]
 categories = ["memory-management"]
 repository = "https://gitlab.torproject.org/tpo/core/arti.git/"
 
+[lints]
+    workspace = true
+
 [dependencies]
 cfg-if = "1.0.0"
 derive-deftly = { version = "~1.2.0", features = ["full", "beta"] }
