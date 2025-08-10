@@ -4,7 +4,7 @@ We welcome new contributors!  You can get in contact with us on
 [our gitlab instance](https://gitlab.torproject.org/), or on the
 [`\#tor-dev IRC` channel on OFTC](https://www.torproject.org/contact/).
 Make sure to familiarize yourself with our
-[Code of Conduct](https://community.torproject.org/policies/code_of_conduct/).
+[Code of Conduct](https://community.torproject.org/policies/code_of_conduct/) and the [Tor Specification](https://spec.torproject.org/index.html).
 
 The new-account process on our gitlab instance is moderated, to reduce
 spam and abuse.  (*Insert instructions for anonymous usage here*)
