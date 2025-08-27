@@ -19,7 +19,7 @@ use tor_rtcompat::Runtime;
 use crate::{ArtiConfig, Result, TorClient};
 
 /// Run state management commands for an Arti hidden service.
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Args)]
 pub(crate) struct Hss {
     /// Arguments shared by all hss subcommands.
     #[command(flatten)]

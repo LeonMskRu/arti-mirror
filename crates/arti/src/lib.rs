@@ -282,7 +282,6 @@ where
         Hsc(subcommands::hsc::HscSubcommand),
 
         #[cfg(feature = "onion-service-service")]
-        #[command(subcommand)]
         Hss(subcommands::hss::Hss),
 
         #[cfg(feature = "onion-service-cli-extra")]
