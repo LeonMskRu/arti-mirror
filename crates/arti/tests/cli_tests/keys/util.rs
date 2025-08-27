@@ -2,6 +2,8 @@ use std::process::Output;
 
 use assert_cmd::Command;
 
+use crate::util::create_state_dir_entry;
+
 /// Path to a test specific configuration.
 const CFG_PATH: &str = "./tests/testcases/keys/keys.in/keys.toml";
 
@@ -117,7 +119,7 @@ impl KeysListCmd {
             let state_dir_path = state_dir.path().to_path_buf();
             let state_dir_path = state_dir_path.to_str().unwrap();
 
-            let opt = Self::create_state_dir_entry(state_dir_path);
+            let opt = create_state_dir_entry(state_dir_path);
 
             cmd.args(["-o", &opt]);
         }
@@ -129,23 +131,6 @@ impl KeysListCmd {
         }
 
         cmd.output()
-    }
-
-    /// Generates a value suitable for use with the `-o` flag to specify Arti's state directory.
-    ///
-    /// Given a path to the state directory, this function returns a formatted string
-    /// in the form `storage.state_dir="<path>"`, which can be passed directly as an
-    /// `-o <VALUE>` argument.
-    ///
-    /// NOTE: This function will become obsolete or require refactoring once #2132 is resolved.
-    fn create_state_dir_entry(state_dir_path: &str) -> String {
-        let table: toml::Table = [("state_dir".to_string(), state_dir_path.into())]
-            .into_iter()
-            .collect();
-        let table: toml::Table = [("storage".to_string(), table.into())]
-            .into_iter()
-            .collect();
-        toml::to_string(&table).unwrap()
     }
 }
 
