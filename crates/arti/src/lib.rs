@@ -118,13 +118,6 @@ use clap::{Arg, ArgAction, Command, Subcommand, value_parser};
 #[allow(unused_imports)]
 use tracing::{error, info, warn};
 
-#[cfg(any(
-    feature = "hsc",
-    feature = "onion-service-service",
-    feature = "onion-service-cli-extra",
-))]
-use clap::Subcommand as _;
-
 #[cfg(feature = "experimental-api")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-api")))]
 pub use subcommands::proxy::run_proxy as run;
