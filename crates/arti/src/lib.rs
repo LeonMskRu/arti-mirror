@@ -114,7 +114,7 @@ use tor_config::mistrust::BuilderExt as _;
 use tor_rtcompat::ToplevelRuntime;
 
 use anyhow::{Context, Error, Result};
-use clap::{Arg, ArgAction, Command, value_parser};
+use clap::{Arg, ArgAction, Command, Subcommand, value_parser};
 #[allow(unused_imports)]
 use tracing::{error, info, warn};
 
@@ -218,7 +218,7 @@ where
         }
     );
 
-    let clap_app = Command::new("Arti")
+    let mut clap_app = Command::new("Arti")
             .version(env!("CARGO_PKG_VERSION"))
             .long_version(long_version)
             .author("The Tor Project Developers")
@@ -266,31 +266,27 @@ where
                     .action(ArgAction::SetTrue)
                     .help("Don't check permissions on the files we use."),
             )
-            .subcommand(
-                Command::new("proxy")
-                    .about(
-                        "Run Arti in SOCKS proxy mode, proxying connections through the Tor network.",
-                    )
-                    .arg(
-                        Arg::new("socks-port")
-                            .short('p')
-                            .action(ArgAction::Set)
-                            .value_name("PORT")
-                            .help("Port to listen on for SOCKS connections (overrides the port in the config if specified).")
-                    )
-                    .arg(
-                        Arg::new("dns-port")
-                            .short('d')
-                            .action(ArgAction::Set)
-                            .value_name("PORT")
-                            .help("Port to listen on for DNS request (overrides the port in the config if specified).")
-                    )
-            )
             .subcommand_required(true)
             .arg_required_else_help(true);
 
     // When adding a subcommand, it may be necessary to add an entry in
     // `maint/check-cli-help`, to the function `help_arg`.
+
+    #[derive(Subcommand)]
+    enum SubCommands {
+        /// Run Arti in SOCKS proxy mode, proxying connections through the Tor network.
+        Proxy {
+            /// Port to listen on for SOCKS connections (overrides the port in the config).
+            #[arg(short = 'p', value_name = "PORT")]
+            socks_port: Option<u16>,
+
+            /// Port to listen on for DNS requests (overrides the port in the config).
+            #[arg(short = 'd', value_name = "PORT")]
+            dns_port: Option<u16>,
+        },
+    }
+
+    let clap_app = SubCommands::augment_subcommands(clap_app);
 
     cfg_if::cfg_if! {
         if #[cfg(feature = "onion-service-service")] {
@@ -461,18 +457,15 @@ where
 /// function. Please reach out to the Arti developers, so we can work together
 /// to get you the stable API you need.
 pub fn main() {
-    match main_main(std::env::args_os()) {
-        Ok(()) => {}
-        Err(e) => {
-            use arti_client::HintableError;
-            if let Some(hint) = e.hint() {
-                info!("{}", hint);
-            }
+    if let Err(e) = main_main(std::env::args_os()) {
+        use arti_client::HintableError;
+        if let Some(hint) = e.hint() {
+            info!("{}", hint);
+        }
 
-            match e.downcast_ref::<clap::Error>() {
-                Some(clap_err) => clap_err.exit(),
-                None => with_safe_logging_suppressed(|| tor_error::report_and_exit(e)),
-            }
+        match e.downcast_ref::<clap::Error>() {
+            Some(clap_err) => clap_err.exit(),
+            None => with_safe_logging_suppressed(|| tor_error::report_and_exit(e)),
         }
     }
 }
