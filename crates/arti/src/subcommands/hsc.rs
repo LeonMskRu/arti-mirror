@@ -5,7 +5,7 @@ use crate::{Result, TorClient};
 
 use anyhow::{Context, anyhow};
 use arti_client::{HsClientDescEncKey, HsId, InertTorClient, KeystoreSelector, TorClientConfig};
-use clap::{ArgMatches, Args, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, FromArgMatches, Subcommand, ValueEnum};
 use safelog::DisplayRedacted;
 use tor_rtcompat::Runtime;
 

@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use anyhow::Result;
-use clap::{ArgMatches, Args, FromArgMatches, Parser, Subcommand};
+use clap::{ArgMatches, Args, FromArgMatches, Subcommand};
 
 use arti_client::{InertTorClient, TorClient, TorClientConfig};
 use tor_keymgr::KeystoreId;

@@ -11,7 +11,7 @@ use {
 
 use anyhow::anyhow;
 use arti_client::{InertTorClient, TorClientConfig};
-use clap::{ArgMatches, Args, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, FromArgMatches, Subcommand, ValueEnum};
 use safelog::DisplayRedacted;
 use tor_hsservice::{HsId, HsNickname, OnionService};
 use tor_rtcompat::Runtime;

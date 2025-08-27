@@ -277,17 +277,22 @@ where
             #[arg(short = 'd', value_name = "PORT")]
             dns_port: Option<u16>,
         },
+
+        /// Run state management commands for an Arti hidden service client.
         #[cfg(feature = "hsc")]
         #[command(subcommand)]
         Hsc(subcommands::hsc::HscSubcommand),
 
+        /// Run state management commands for an Arti hidden service.
         #[cfg(feature = "onion-service-service")]
         Hss(subcommands::hss::Hss),
 
+        /// Run keystore management commands.
         #[cfg(feature = "onion-service-cli-extra")]
         #[command(subcommand)]
         Keys(subcommands::keys::KeysSubcommand),
 
+        /// Run plumbing key management commands.
         #[cfg(feature = "onion-service-cli-extra")]
         #[command(name = "keys-raw", subcommand)]
         Raw(subcommands::raw::RawSubcommand),
