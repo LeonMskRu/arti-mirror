@@ -228,6 +228,7 @@ tor-config = { path = "../tor-config", version = "0.34.0", features = ["testing"
 tor-memquota = { version = "0.34.0", path = "../tor-memquota", default-features = false, features = ["testing"] }
 tor-rtmock = { path = "../tor-rtmock", version = "0.34.0" }
 trycmd = "0.15.4"
+walkdir = "2"
 [package.metadata.docs.rs]
 all-features = true
 
