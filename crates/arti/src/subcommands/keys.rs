@@ -17,14 +17,7 @@ use tor_rtcompat::Runtime;
 // TODO: use COLUMNS instead of an arbitrary LINE_LEN
 const LINE_LEN: usize = 80;
 
-/// The `keys` subcommands the arti CLI will be augmented with.
-#[derive(Debug, Parser)]
-pub(crate) enum KeysSubcommands {
-    /// Run keystore management commands.
-    #[command(subcommand)]
-    Keys(KeysSubcommand),
-}
-
+/// Run keystore management commands.
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum KeysSubcommand {
     /// List keys and certificates.

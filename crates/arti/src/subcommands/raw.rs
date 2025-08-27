@@ -9,14 +9,7 @@ use arti_client::{InertTorClient, TorClient, TorClientConfig};
 use tor_keymgr::KeystoreId;
 use tor_rtcompat::Runtime;
 
-/// The `keys-raw` subcommands the arti CLI will be augmented with.
-#[derive(Debug, Parser)]
-pub(crate) enum RawSubcommands {
-    /// Run plumbing key management commands.
-    #[command(subcommand)]
-    KeysRaw(RawSubcommand),
-}
-
+/// Run plumbing key management commands.
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum RawSubcommand {
     /// Remove keystore entry by raw ID.

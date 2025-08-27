@@ -284,28 +284,20 @@ where
             #[arg(short = 'd', value_name = "PORT")]
             dns_port: Option<u16>,
         },
+        #[cfg(feature = "hsc")]
+        Hsc(subcommands::hsc::HscSubcommand),
+
+        #[cfg(feature = "onion-service-service")]
+        Hss(subcommands::hss::Hss),
+
+        #[cfg(feature = "onion-service-cli-extra")]
+        Keys(subcommands::keys::KeysSubcommand),
+
+        #[cfg(feature = "onion-service-cli-extra")]
+        Raw(subcommands::raw::RawSubcommand),
     }
 
     let clap_app = SubCommands::augment_subcommands(clap_app);
-
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "onion-service-service")] {
-            let clap_app = subcommands::hss::HssSubcommands::augment_subcommands(clap_app);
-        }
-    }
-
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "hsc")] {
-            let clap_app = subcommands::hsc::HscSubcommands::augment_subcommands(clap_app);
-        }
-    }
-
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "onion-service-cli-extra")] {
-            let clap_app = subcommands::keys::KeysSubcommands::augment_subcommands(clap_app);
-            let clap_app = subcommands::raw::RawSubcommands::augment_subcommands(clap_app);
-        }
-    }
 
     // Tracing doesn't log anything when there is no subscriber set.  But we want to see
     // logging messages from config parsing etc.  We can't set the global default subscriber

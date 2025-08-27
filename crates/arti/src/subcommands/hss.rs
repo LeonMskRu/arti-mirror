@@ -18,13 +18,7 @@ use tor_rtcompat::Runtime;
 
 use crate::{ArtiConfig, Result, TorClient};
 
-/// The hss subcommands the arti CLI will be augmented with.
-#[derive(Parser, Debug)]
-pub(crate) enum HssSubcommands {
-    /// Run state management commands for an Arti hidden service.
-    Hss(Hss),
-}
-
+/// Run state management commands for an Arti hidden service.
 #[derive(Debug, Parser)]
 pub(crate) struct Hss {
     /// Arguments shared by all hss subcommands.
