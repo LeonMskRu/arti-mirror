@@ -218,7 +218,7 @@ where
         }
     );
 
-    let mut clap_app = Command::new("Arti")
+    let clap_app = Command::new("Arti")
             .version(env!("CARGO_PKG_VERSION"))
             .long_version(long_version)
             .author("The Tor Project Developers")
