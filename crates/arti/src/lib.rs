@@ -278,16 +278,20 @@ where
             dns_port: Option<u16>,
         },
         #[cfg(feature = "hsc")]
-        Hsc(#[command(subcommand)] subcommands::hsc::HscSubcommand),
+        #[command(subcommand)]
+        Hsc(subcommands::hsc::HscSubcommand),
 
         #[cfg(feature = "onion-service-service")]
-        Hss(#[command(subcommand)] subcommands::hss::Hss),
+        #[command(subcommand)]
+        Hss(subcommands::hss::Hss),
 
         #[cfg(feature = "onion-service-cli-extra")]
-        Keys(#[command(subcommand)] subcommands::keys::KeysSubcommand),
+        #[command(subcommand)]
+        Keys(subcommands::keys::KeysSubcommand),
 
         #[cfg(feature = "onion-service-cli-extra")]
-        Raw(#[command(subcommand)] subcommands::raw::RawSubcommand),
+        #[command(subcommand)]
+        Raw(subcommands::raw::RawSubcommand),
     }
 
     let clap_app = SubCommands::augment_subcommands(clap_app);
