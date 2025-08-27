@@ -289,7 +289,7 @@ where
         Keys(subcommands::keys::KeysSubcommand),
 
         #[cfg(feature = "onion-service-cli-extra")]
-        #[command(subcommand)]
+        #[command(name = "keys-raw", subcommand)]
         Raw(subcommands::raw::RawSubcommand),
     }
 
