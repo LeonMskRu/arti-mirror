@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
 import fnmatch
-import sys
 import os
 import re
 import shutil
 import subprocess
+import sys
+from typing import TextIO
 
 # ---------- actual list of lints to apply (or disapply) ----------
 
@@ -77,12 +80,9 @@ TEST_LINTS = """
 
 # ---------- list of lints to apply or disapply *in examples* ----------
 
-EXAMPLE_LINTS = (
-    """
+EXAMPLE_LINTS = """
 #![allow(unknown_lints)] // @@REMOVE_WHEN(ci_arti_nightly)
-"""
-    + TEST_LINTS.strip()
-)
+""" + TEST_LINTS.strip()
 
 
 # ---------- some notes about lints we might use - NOT USED by any code here ----------
@@ -129,28 +129,28 @@ deferred_errors = []
 
 
 class ImproperFile(Exception):
-    def __init__(self, lno, message):
+    def __init__(self, lno: int, message: str) -> None:
         self.lno = lno
         self.message = message
 
 
-def strip_lints_containing(s):
-    """Remove every lint containing 's'."""
+def strip_lints_containing(
+    lint_lists: dict[str, str], substring: str
+) -> dict[str, str]:
+    """Return a copy of lint_lists with all entries containing substring removed."""
+    return {
+        name: "\n".join(line for line in lines.split("\n") if substring not in line)
+        for name, lines in lint_lists.items()
+    }
 
-    def rmv_lints(inp, s):
-        return "\n".join(line for line in inp.split("\n") if s not in line)
 
-    global LINT_LISTS
-    LINT_LISTS = dict((k, rmv_lints(v, s)) for (k, v) in LINT_LISTS.items())
-
-
-def filter_file(lints, inp, outp, insist):
+def filter_file(
+    lint_lists: dict[str, str], inp: TextIO, outp: TextIO, insist: bool
+) -> None:
     in_lint_list = None
     found_lint_list = False
-    lno = 0
-    for line in inp.readlines():
-        lno += 1
 
+    for lno, line in enumerate(inp, start=1):
         if start_match := START_LINE.match(line):
             if in_lint_list:
                 raise ImproperFile(
@@ -174,11 +174,10 @@ def filter_file(lints, inp, outp, insist):
                 )
 
             try:
-                lints = LINT_LISTS[in_lint_list]
-            except KeyError:
-                raise ImproperFile(lno, "No such lint list as " + in_lint_list)
-            for lint in lints.strip().split("\n"):
-                outp.write(indent + lint + "\n")
+                lints = lint_lists[in_lint_list]
+            except KeyError as e:
+                raise ImproperFile(lno, "No such lint list as " + in_lint_list) from e
+            outp.writelines(indent + lint + "\n" for lint in lints.strip().split("\n"))
             in_lint_list = None
         elif in_lint_list:
             if not PAT.match(line):
@@ -196,7 +195,7 @@ def filter_file(lints, inp, outp, insist):
         )
 
 
-def process(lints, fn, always_insist):
+def process(lint_lists: dict[str, str], fn: str, always_insist: bool) -> None:
     insist = (
         always_insist
         or fnmatch.fnmatch(fn, "crates/*/src/lib.rs")
@@ -205,9 +204,9 @@ def process(lints, fn, always_insist):
 
     tmp_name = fn + ".tmp~"
     outp = open(tmp_name, "w")
-    inp = open(fn, "r")
+    inp = open(fn)
     try:
-        filter_file(lints, inp, outp, insist)
+        filter_file(lint_lists, inp, outp, insist)
     except ImproperFile as e:
         print("%s:%d: %s" % (fn, e.lno, e.message), file=sys.stderr)
         deferred_errors.append(fn)
@@ -224,7 +223,7 @@ def process(lints, fn, always_insist):
         shutil.move(tmp_name, fn)
 
 
-def main(lints, files):
+def main(lint_lists: dict[str, str], files: list[str]) -> None:
     if not os.path.exists("./crates/tor-proto/src/lib.rs"):
         print("Run this from the top level of an arti repo.")
         sys.exit(1)
@@ -237,13 +236,17 @@ def main(lints, files):
         files = files.decode("utf-8").rstrip("\n").split("\n")
         always_insist = False
 
+    lint_lists = LINT_LISTS
+
     if opts.ci_nightly:
-        strip_lints_containing("@@REMOVE_WHEN(ci_arti_nightly)")
+        lint_lists = strip_lints_containing(
+            lint_lists, "@@REMOVE_WHEN(ci_arti_nightly)"
+        )
     if opts.ci_stable:
-        strip_lints_containing("@@REMOVE_WHEN(ci_arti_stable)")
+        lint_lists = strip_lints_containing(lint_lists, "@@REMOVE_WHEN(ci_arti_stable)")
 
     for fn in files:
-        process(lints, fn, always_insist)
+        process(lint_lists, fn, always_insist)
 
     if len(deferred_errors) > 0:
         print(
@@ -265,4 +268,4 @@ if __name__ == "__main__":
     parser.add_argument("file", nargs="*")
     opts = parser.parse_args()
 
-    main(WANT_LINTS, opts.file)
+    main(LINT_LISTS, opts.file)
