@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import os
 import re
 import shutil
 import subprocess
 import sys
+from contextlib import suppress
+from pathlib import Path
 from typing import TextIO
 
 # ---------- actual list of lints to apply (or disapply) ----------
@@ -128,7 +129,7 @@ opts = None
 deferred_errors = []
 
 
-class ImproperFile(Exception):
+class ImproperFileError(Exception):
     def __init__(self, lno: int, message: str) -> None:
         self.lno = lno
         self.message = message
@@ -153,7 +154,7 @@ def filter_file(
     for lno, line in enumerate(inp, start=1):
         if start_match := START_LINE.match(line):
             if in_lint_list:
-                raise ImproperFile(
+                raise ImproperFileError(
                     lno, 'found "@@ begin lint list" but inside lint list'
                 )
             found_lint_list = True
@@ -161,11 +162,11 @@ def filter_file(
             in_lint_list = start_match.group(2)
         elif end_match := END_LINE.match(line):
             if not in_lint_list:
-                raise ImproperFile(
+                raise ImproperFileError(
                     lno, 'found "@@ end lint list" but not inside lint list'
                 )
             if in_lint_list != end_match.group(1):
-                raise ImproperFile(
+                raise ImproperFileError(
                     lno,
                     "found end tag "
                     + end_match.group(1)
@@ -176,21 +177,25 @@ def filter_file(
             try:
                 lints = lint_lists[in_lint_list]
             except KeyError as e:
-                raise ImproperFile(lno, "No such lint list as " + in_lint_list) from e
+                raise ImproperFileError(
+                    lno, "No such lint list as " + in_lint_list
+                ) from e
             outp.writelines(indent + lint + "\n" for lint in lints.strip().split("\n"))
             in_lint_list = None
         elif in_lint_list:
             if not PAT.match(line):
-                raise ImproperFile(lno, "entry in lint list does not look like a lint")
+                raise ImproperFileError(
+                    lno, "entry in lint list does not look like a lint"
+                )
             # do not send to output
             continue
         outp.write(line)
     if in_lint_list:
-        raise ImproperFile(
+        raise ImproperFileError(
             lno, 'missing "@@ lint list" delimiter, still in lint list at EOF'
         )
     if insist and not found_lint_list:
-        raise ImproperFile(
+        raise ImproperFileError(
             lno, "standard lint list block seems to be missing (wrong delimiters?)"
         )
 
@@ -202,29 +207,28 @@ def process(lint_lists: dict[str, str], fn: str, always_insist: bool) -> None:
         or fnmatch.fnmatch(fn, "crates/*/src/main.rs")
     )
 
-    tmp_name = fn + ".tmp~"
-    outp = open(tmp_name, "w")
-    inp = open(fn)
+    path = Path(fn)
+    tmp_path = path.parent / (path.name + ".tmp~")
+
     try:
-        filter_file(lint_lists, inp, outp, insist)
-    except ImproperFile as e:
-        print("%s:%d: %s" % (fn, e.lno, e.message), file=sys.stderr)
+        with path.open("r") as inp, tmp_path.open("w") as outp:
+            filter_file(lint_lists, inp, outp, insist)
+    except ImproperFileError as e:
+        print(f"{fn}:{e.lno}: {e.message}", file=sys.stderr)
         deferred_errors.append(fn)
-        os.remove(tmp_name)  # this tmp file is probably partial
+        with suppress(FileNotFoundError):
+            tmp_path.unlink()
         return
 
-    inp.close()
-    outp.close()
-
     if opts.check:
-        if subprocess.run(["diff", "-u", "--", fn, tmp_name]).returncode != 0:
+        if subprocess.run(["diff", "-u", "--", fn, str(tmp_path)]).returncode != 0:
             deferred_errors.append(fn)
     else:
-        shutil.move(tmp_name, fn)
+        shutil.move(str(tmp_path), str(path))
 
 
 def main(lint_lists: dict[str, str], files: list[str]) -> None:
-    if not os.path.exists("./crates/tor-proto/src/lib.rs"):
+    if not Path("./crates/tor-proto/src/lib.rs").exists():
         print("Run this from the top level of an arti repo.")
         sys.exit(1)
 
