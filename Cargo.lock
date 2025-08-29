@@ -51,52 +51,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "amplify"
-version = "4.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f7fb4ac7c881e54a8e7015e399b6112a2a5bc958b6c89ac510840ff20273b31"
-dependencies = [
- "amplify_derive",
- "amplify_num",
- "ascii",
- "getrandom 0.2.16",
- "getrandom 0.3.3",
- "wasm-bindgen",
-]
-
-[[package]]
-name = "amplify_derive"
-version = "4.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a6309e6b8d89b36b9f959b7a8fa093583b94922a0f6438a24fb08936de4d428"
-dependencies = [
- "amplify_syn",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "amplify_num"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99bcb75a2982047f733547042fc3968c0f460dfcf7d90b90dea3b2744580e9ad"
-dependencies = [
- "wasm-bindgen",
-]
-
-[[package]]
-name = "amplify_syn"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7736fb8d473c0d83098b5bac44df6a561e20470375cd8bcae30516dc889fd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "android-tzdata"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -487,12 +441,6 @@ dependencies = [
  "tor-rtcompat",
  "ureq",
 ]
-
-[[package]]
-name = "ascii"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
 name = "asn1-rs"
@@ -2474,10 +2422,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "335ff9f135e4384c8150d6f27c6daed433577f86b4750418338c01a1a2528592"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2487,11 +2433,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26145e563e54f2cadc477553f1ec5ee650b00862f0a58bcd12cbdc5f0ea2d2f4"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi",
  "wasi 0.14.2+wasi-0.2.4",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2503,7 +2447,7 @@ dependencies = [
  "proc-macro-error2",
  "proc-macro2",
  "quote",
- "syn 2.0.104",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -5871,13 +5815,13 @@ dependencies = [
 name = "tor-cell"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "bitflags 2.9.3",
  "bytes",
  "caret",
  "derive-deftly 1.2.0",
  "derive_more",
  "educe",
+ "getset",
  "hex",
  "hex-literal",
  "itertools 0.14.0",
@@ -5969,7 +5913,6 @@ dependencies = [
 name = "tor-circmgr"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "async-trait",
  "bounded-vec-deque",
  "cfg-if",
@@ -6024,7 +5967,6 @@ dependencies = [
 name = "tor-config"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "cfg-if",
  "derive-deftly 1.2.0",
  "derive_builder_fork_arti",
@@ -6033,6 +5975,7 @@ dependencies = [
  "figment",
  "fs-mistrust",
  "futures",
+ "getset",
  "itertools 0.14.0",
  "notify",
  "paste",
@@ -6226,7 +6169,6 @@ dependencies = [
 name = "tor-guardmgr"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "base64ct",
  "derive-deftly 1.2.0",
  "derive_builder_fork_arti",
@@ -6236,6 +6178,7 @@ dependencies = [
  "float_eq",
  "fs-mistrust",
  "futures",
+ "getset",
  "humantime",
  "humantime-serde",
  "itertools 0.14.0",
@@ -6385,7 +6328,6 @@ dependencies = [
 name = "tor-hsservice"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "arrayvec",
  "async-trait",
  "base64ct",
@@ -6398,6 +6340,7 @@ dependencies = [
  "equix",
  "fs-mistrust",
  "futures",
+ "getset",
  "growable-bloom-filter",
  "hex",
  "humantime",
@@ -6476,7 +6419,6 @@ dependencies = [
 name = "tor-keymgr"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "arrayvec",
  "cfg-if",
  "data-encoding",
@@ -6486,6 +6428,7 @@ dependencies = [
  "downcast-rs",
  "dyn-clone",
  "fs-mistrust",
+ "getset",
  "glob-match",
  "humantime",
  "inventory",
@@ -6673,7 +6616,6 @@ dependencies = [
 name = "tor-netdoc"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "anyhow",
  "base64ct",
  "bitflags 2.9.3",
@@ -6683,6 +6625,7 @@ dependencies = [
  "derive_more",
  "digest",
  "educe",
+ "getset",
  "hex",
  "hex-literal",
  "humantime",
@@ -6724,7 +6667,6 @@ dependencies = [
 name = "tor-persist"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "anyhow",
  "derive-deftly 1.2.0",
  "derive_more",
@@ -6733,6 +6675,7 @@ dependencies = [
  "fslock",
  "fslock-guard",
  "futures",
+ "getset",
  "humantime",
  "itertools 0.14.0",
  "oneshot-fused-workaround",
@@ -6757,7 +6700,6 @@ name = "tor-proto"
 version = "0.34.0"
 dependencies = [
  "aes",
- "amplify",
  "asynchronous-codec",
  "bitvec",
  "bytes",
@@ -6775,6 +6717,7 @@ dependencies = [
  "educe",
  "futures",
  "futures-util",
+ "getset",
  "hex",
  "hex-literal",
  "hkdf",
@@ -6984,7 +6927,6 @@ dependencies = [
 name = "tor-rtmock"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "assert_matches",
  "async-trait",
  "derive-deftly 1.2.0",
@@ -6992,6 +6934,7 @@ dependencies = [
  "educe",
  "futures",
  "futures-await-test",
+ "getset",
  "humantime",
  "itertools 0.14.0",
  "oneshot-fused-workaround",
@@ -7014,12 +6957,12 @@ dependencies = [
 name = "tor-socksproto"
 version = "0.34.0"
 dependencies = [
- "amplify",
  "anyhow",
  "arbitrary",
  "caret",
  "derive-deftly 1.2.0",
  "educe",
+ "getset",
  "hex-literal",
  "safelog",
  "subtle",
