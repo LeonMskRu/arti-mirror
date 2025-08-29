@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import re
 import subprocess
 import sys
@@ -208,8 +207,8 @@ def process(
     """
     insist = (
         always_insist
-        or fnmatch.fnmatch(str(fn), "crates/*/src/lib.rs")
-        or fnmatch.fnmatch(str(fn), "crates/*/src/main.rs")
+        or fn.match("crates/*/src/lib.rs")
+        or fn.match("crates/*/src/main.rs")
     )
 
     tmp = fn.parent / (fn.name + ".tmp~")
