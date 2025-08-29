@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import re
-import shutil
 import subprocess
 import sys
 from contextlib import suppress
@@ -19,7 +18,7 @@ from typing import TextIO
 # a future version of the compiler might refuse to build our code
 # entirely.
 
-WANT_LINTS = """
+WANT_LINTS: list[str] = """
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
 #![allow(unknown_lints)] // @@REMOVE_WHEN(ci_arti_nightly)
 #![warn(missing_docs)]
@@ -61,11 +60,11 @@ WANT_LINTS = """
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
 #![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
-"""
+""".split("\n")
 
 # ---------- list of lints to apply or disapply *in tests* ----------
 
-TEST_LINTS = """
+TEST_LINTS: list[str] = """
 #![allow(clippy::bool_assert_comparison)]
 #![allow(clippy::clone_on_copy)]
 #![allow(clippy::dbg_macro)]
@@ -77,35 +76,35 @@ TEST_LINTS = """
 #![allow(clippy::unchecked_duration_subtraction)]
 #![allow(clippy::useless_vec)]
 #![allow(clippy::needless_pass_by_value)]
-"""
+""".split("\n")
 
 # ---------- list of lints to apply or disapply *in examples* ----------
 
-EXAMPLE_LINTS = """
-#![allow(unknown_lints)] // @@REMOVE_WHEN(ci_arti_nightly)
-""" + TEST_LINTS.strip()
+EXAMPLE_LINTS = [
+    "#![allow(unknown_lints)] // @@REMOVE_WHEN(ci_arti_nightly)",
+    *TEST_LINTS,
+]
 
 
 # ---------- some notes about lints we might use - NOT USED by any code here ----------
 
-SOON = """
-"""
+SOON: list[str] = []
 
-WISH_WE_COULD = """
-#![warn(unused_crate_dependencies)]
-"""
+WISH_WE_COULD = [
+    "#![warn(unused_crate_dependencies)]",
+]
 
-DECIDED_NOT = """
-#![deny(clippy::redundant_pub_crate)]
-#![deny(clippy::future_not_send)]
-#![deny(clippy::redundant_closure_for_method_calls)]
-#![deny(clippy::panic)]
-#![deny(clippy::if_then_some_else_none)]
-#![deny(clippy::expect_used)]
-#![deny(clippy::option_if_let_else)]
-#![deny(missing_debug_implementations)]
-#![deny(clippy::pub_enum_variant_names)]
-"""
+DECIDED_NOT = [
+    "#![deny(clippy::redundant_pub_crate)]",
+    "#![deny(clippy::future_not_send)]",
+    "#![deny(clippy::redundant_closure_for_method_calls)]",
+    "#![deny(clippy::panic)]",
+    "#![deny(clippy::if_then_some_else_none)]",
+    "#![deny(clippy::expect_used)]",
+    "#![deny(clippy::option_if_let_else)]",
+    "#![deny(missing_debug_implementations)]",
+    "#![deny(clippy::pub_enum_variant_names)]",
+]
 
 # ---------- code for autoprocessing Rust source files ----------
 
@@ -125,9 +124,6 @@ START_LINE = re.compile(r"^(\s*)// @@ begin (.*) list")
 # It does end up in the output HTML from Rustdoc, but it is harmless there.
 END_LINE = re.compile(r"^\s*//! <!-- @@ end (.*) list")
 
-opts = None
-deferred_errors = []
-
 
 class ImproperFileError(Exception):
     def __init__(self, lno: int, message: str) -> None:
@@ -136,20 +132,21 @@ class ImproperFileError(Exception):
 
 
 def strip_lints_containing(
-    lint_lists: dict[str, str], substring: str
-) -> dict[str, str]:
+    lint_lists: dict[str, list[str]], substring: str
+) -> dict[str, list[str]]:
     """Return a copy of lint_lists with all entries containing substring removed."""
     return {
-        name: "\n".join(line for line in lines.split("\n") if substring not in line)
+        name: [line for line in lines if substring not in line]
         for name, lines in lint_lists.items()
     }
 
 
 def filter_file(
-    lint_lists: dict[str, str], inp: TextIO, outp: TextIO, insist: bool
+    lint_lists: dict[str, list[str]], inp: TextIO, outp: TextIO, insist: bool
 ) -> None:
-    in_lint_list = None
+    in_lint_list: str | None = None
     found_lint_list = False
+    lno = 0  # ensure defined even for empty files
 
     for lno, line in enumerate(inp, start=1):
         if start_match := START_LINE.match(line):
@@ -173,21 +170,19 @@ def filter_file(
                     + " but expected "
                     + in_lint_list,
                 )
-
             try:
-                lints = lint_lists[in_lint_list]
+                lines = lint_lists[in_lint_list]
             except KeyError as e:
                 raise ImproperFileError(
                     lno, "No such lint list as " + in_lint_list
                 ) from e
-            outp.writelines(indent + lint + "\n" for lint in lints.strip().split("\n"))
+            outp.writelines(indent + lint + "\n" for lint in lines)
             in_lint_list = None
         elif in_lint_list:
             if not PAT.match(line):
                 raise ImproperFileError(
                     lno, "entry in lint list does not look like a lint"
                 )
-            # do not send to output
             continue
         outp.write(line)
     if in_lint_list:
@@ -200,57 +195,74 @@ def filter_file(
         )
 
 
-def process(lint_lists: dict[str, str], fn: str, always_insist: bool) -> None:
+def process(
+    lint_lists: dict[str, list[str]],
+    fn: Path,
+    *,
+    always_insist: bool,
+    check: bool,
+) -> bool:
+    """Process the file named fn, replacing its lint list if needed.
+
+    Return True if the file is OK, False if it produced an error or mismatch.
+    """
     insist = (
         always_insist
-        or fnmatch.fnmatch(fn, "crates/*/src/lib.rs")
-        or fnmatch.fnmatch(fn, "crates/*/src/main.rs")
+        or fnmatch.fnmatch(str(fn), "crates/*/src/lib.rs")
+        or fnmatch.fnmatch(str(fn), "crates/*/src/main.rs")
     )
 
-    path = Path(fn)
-    tmp_path = path.parent / (path.name + ".tmp~")
+    tmp = fn.parent / (fn.name + ".tmp~")
 
     try:
-        with path.open("r") as inp, tmp_path.open("w") as outp:
+        with fn.open("r") as inp, tmp.open("w") as outp:
             filter_file(lint_lists, inp, outp, insist)
     except ImproperFileError as e:
         print(f"{fn}:{e.lno}: {e.message}", file=sys.stderr)
-        deferred_errors.append(fn)
         with suppress(FileNotFoundError):
-            tmp_path.unlink()
-        return
+            tmp.unlink()
+        return False
 
-    if opts.check:
-        if subprocess.run(["diff", "-u", "--", fn, str(tmp_path)]).returncode != 0:
-            deferred_errors.append(fn)
+    if check:
+        if subprocess.run(["diff", "-u", "--", str(fn), str(tmp)]).returncode != 0:
+            return False
     else:
-        shutil.move(str(tmp_path), str(path))
+        tmp.replace(fn)
+
+    return True
 
 
-def main(lint_lists: dict[str, str], files: list[str]) -> None:
+def main(
+    lint_lists: dict[str, list[str]],
+    files: list[Path],
+    *,
+    check: bool,
+    ci_nightly: bool,
+    ci_stable: bool,
+) -> None:
     if not Path("./crates/tor-proto/src/lib.rs").exists():
         print("Run this from the top level of an arti repo.")
         sys.exit(1)
 
     always_insist = True
     if not files:
-        files = subprocess.run(
-            ["find", ".", "-name", "*.rs"], stdout=subprocess.PIPE, check=True
-        ).stdout
-        files = files.decode("utf-8").rstrip("\n").split("\n")
+        files = list(Path().rglob("*.rs"))
         always_insist = False
 
     lint_lists = LINT_LISTS
 
-    if opts.ci_nightly:
+    if ci_nightly:
         lint_lists = strip_lints_containing(
             lint_lists, "@@REMOVE_WHEN(ci_arti_nightly)"
         )
-    if opts.ci_stable:
+    if ci_stable:
         lint_lists = strip_lints_containing(lint_lists, "@@REMOVE_WHEN(ci_arti_stable)")
 
-    for fn in files:
-        process(lint_lists, fn, always_insist)
+    deferred_errors = [
+        str(fn)
+        for fn in files
+        if not process(lint_lists, fn, always_insist=always_insist, check=check)
+    ]
 
     if len(deferred_errors) > 0:
         print(
@@ -269,7 +281,13 @@ if __name__ == "__main__":
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--ci-nightly", action="store_true")
     parser.add_argument("--ci-stable", action="store_true")
-    parser.add_argument("file", nargs="*")
+    parser.add_argument("file", nargs="*", type=Path)
     opts = parser.parse_args()
 
-    main(LINT_LISTS, opts.file)
+    main(
+        LINT_LISTS,
+        opts.file,
+        check=opts.check,
+        ci_nightly=opts.ci_nightly,
+        ci_stable=opts.ci_stable,
+    )
