@@ -1,5 +1,4 @@
-use std::{future::Future, io, pin::Pin};
-use std::ops::{Deref, DerefMut};
+use std::{pin::Pin, future::Future, io, task::{Context, Poll}};
 use hyper::rt::{Read, Write};
 use tower_service::Service;
 use http::Uri;
@@ -19,6 +18,68 @@ pub trait IoAdapter<S>: Send + Sync + 'static {
 }
 
 pub enum TlsMode { Plain, Tls }
+
+pub enum MaybeTls<Plain, Tls> {
+    Plain(Plain),
+    Tls(Tls),
+}
+
+impl<P, T> Read for MaybeTls<P, T>
+where
+    P: Read + Unpin,
+    T: Read + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        unsafe {
+            match self.get_unchecked_mut() {
+                MaybeTls::Plain(p) => Pin::new_unchecked(p).poll_read(cx, buf),
+                MaybeTls::Tls(t)   => Pin::new_unchecked(t).poll_read(cx, buf),
+            }
+        }
+    }
+}
+
+impl<P, T> Write for MaybeTls<P, T>
+where
+    P: Write + Unpin,
+    T: Write + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        unsafe {
+            match self.get_unchecked_mut() {
+                MaybeTls::Plain(p) => Pin::new_unchecked(p).poll_write(cx, buf),
+                MaybeTls::Tls(t)   => Pin::new_unchecked(t).poll_write(cx, buf),
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        unsafe {
+            match self.get_unchecked_mut() {
+                MaybeTls::Plain(p) => Pin::new_unchecked(p).poll_flush(cx),
+                MaybeTls::Tls(t)   => Pin::new_unchecked(t).poll_flush(cx),
+            }
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        unsafe {
+            match self.get_unchecked_mut() {
+                MaybeTls::Plain(p) => Pin::new_unchecked(p).poll_shutdown(cx),
+                MaybeTls::Tls(t)   => Pin::new_unchecked(t).poll_shutdown(cx),
+            }
+        }
+    }
+}
+
 
 pub trait TlsUpgrader<I>: Send + Sync + 'static {
     type Io: Send + Unpin + 'static;
