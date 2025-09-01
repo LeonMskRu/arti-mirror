@@ -1,4 +1,9 @@
-use std::{path::Path, process::Output};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Output,
+    str::FromStr,
+};
 
 use assert_cmd::Command;
 use tempfile::TempDir;
@@ -8,6 +13,58 @@ use crate::util::create_state_dir_entry;
 
 /// Path to a test specific configuration.
 const CFG_PATH: &str = "./tests/testcases/hss-extra/conf/hss.toml";
+
+/// Path to a fully populated Arti native keystore.
+const KEYSTORE_PATH: &str = "./tests/testcases/hss-extra/hss.in/local/state-dir";
+
+/// Path to the long-term ID key, relative to the state directory.
+pub const EXPECTED_ID_KEY_PATH: &str = "keystore/hss/allium-cepa/ks_hs_id.ed25519_expanded_private";
+
+/// Path to the keystore directory, relative to the state directory.
+pub const KEYSTORE_DIR_PATH: &str = "keystore";
+
+/// Path to the keystore directory, relative to the state directory.
+pub const HSS_DIR_PATH: &str = "keystore/hss";
+
+/// Path to the keystore directory, relative to the state directory.
+pub const SERVICE_DIR_PATH: &str = "keystore/hss/allium-cepa";
+
+/// Path to an unrecognized keystore entry, relative to the state directory.
+pub const EXPECTED_UNRECOGNIZED_KEYSTORE_ENTRY: &str = "keystore/hss/allium-cepa/herba-spontanea";
+
+/// Path to ipts directory, relative to the state directory.
+pub const IPTS_DIR_PATH: &str = "keystore/hss/allium-cepa/ipts";
+
+/// A part of an unrecognized path, relative to the state directory.
+pub const UNRECOGNIZED_DIR_PATH: &str = "keystore/opus-abusivum";
+
+/// A part of an unrecognized path, relative to the state directory.
+pub const UNRECOGNIZED_SERVICE_PATH: &str = "keystore/opus-abusivum/herba-spontanea";
+
+/// Unrecognized path, relative to the state directory.
+pub const UNRECOGNIZED_SERVICE_ID_PATH: &str =
+    "keystore/opus-abusivum/herba-spontanea/ks_hs_id.ed25519_expanded_private";
+
+/// A collection of every path present in the default state directory.
+pub const ARTI_KEYSTORE_POPULATION: &[&str] = &[
+    KEYSTORE_DIR_PATH,
+    HSS_DIR_PATH,
+    SERVICE_DIR_PATH,
+    EXPECTED_ID_KEY_PATH,
+    EXPECTED_UNRECOGNIZED_KEYSTORE_ENTRY,
+    "keystore/hss/allium-cepa/ks_hs_blind_id+20326_1440_43200.ed25519_expanded_private",
+    "keystore/hss/allium-cepa/ks_hs_blind_id+20327_1440_43200.ed25519_expanded_private",
+    IPTS_DIR_PATH,
+    "keystore/hss/allium-cepa/ipts/k_sid+ce8514e2fe016e4705b064f2226a7628f4226e9a15d28607112e4eac3b3a012f.ed25519_private",
+    "keystore/hss/allium-cepa/ipts/k_sid+2a6054c3432b880b76cf379f66daf1a34c88693efed5e85bd90507a1fea231d7.ed25519_private",
+    "keystore/hss/allium-cepa/ipts/k_sid+84a3a863484ff521081ee8e6e48a6129d0c83bef89fe294a5dda6f782b43dec8.ed25519_private",
+    "keystore/hss/allium-cepa/ipts/k_hss_ntor+ce8514e2fe016e4705b064f2226a7628f4226e9a15d28607112e4eac3b3a012f.x25519_private",
+    "keystore/hss/allium-cepa/ipts/k_hss_ntor+84a3a863484ff521081ee8e6e48a6129d0c83bef89fe294a5dda6f782b43dec8.x25519_private",
+    "keystore/hss/allium-cepa/ipts/k_hss_ntor+2a6054c3432b880b76cf379f66daf1a34c88693efed5e85bd90507a1fea231d7.x25519_private",
+    UNRECOGNIZED_DIR_PATH,
+    UNRECOGNIZED_SERVICE_PATH,
+    UNRECOGNIZED_SERVICE_ID_PATH,
+];
 
 /// A struct that represents the subcommand `hss ctor-migrate`.
 #[derive(Debug)]
@@ -19,7 +76,7 @@ pub struct CTorMigrateCmd {
     #[allow(dead_code)]
     state_dir: TempDir,
     /// The file path to the state directory.
-    state_dir_path: String,
+    state_dir_path: PathBuf,
 }
 
 impl CTorMigrateCmd {
@@ -27,7 +84,6 @@ impl CTorMigrateCmd {
     pub fn new() -> Self {
         let state_dir = TempDir::new().unwrap();
         let state_dir_path = state_dir.path().to_path_buf();
-        let state_dir_path = state_dir_path.to_string_lossy().to_string();
         Self {
             state_dir,
             state_dir_path,
@@ -38,7 +94,7 @@ impl CTorMigrateCmd {
     pub fn output(&self) -> std::io::Result<Output> {
         let mut cmd = Command::cargo_bin("arti").unwrap();
 
-        let opt = create_state_dir_entry(&self.state_dir_path);
+        let opt = create_state_dir_entry(self.state_dir_path.to_string_lossy().as_ref());
         cmd.args([
             "-c",
             CFG_PATH,
@@ -54,26 +110,63 @@ impl CTorMigrateCmd {
         cmd.output()
     }
 
+    /// Populates the temporary state directory with the files from the default state directory.
+    pub fn populate_state_dir(&self) {
+        let keystore_path = PathBuf::from_str(KEYSTORE_PATH).unwrap();
+        Self::clone_dir(&keystore_path, &self.state_dir_path);
+    }
+
+    /// Recursively clones the entire contents of the directory `source` into the
+    /// directory `destination`.
+    ///
+    /// This function does not check whether `source` and `destination` exist,
+    /// whether they are directories, or perform any other validation.
+    fn clone_dir(source: &Path, destination: &Path) {
+        let entries = fs::read_dir(source).unwrap();
+        for entry in entries {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            let source_path = entry.path();
+            let file_name = source_path.file_name().unwrap();
+            let destination_path = destination.join(file_name);
+            if file_type.is_dir() {
+                fs::create_dir(&destination_path).unwrap();
+                Self::clone_dir(&source_path, &destination_path);
+            } else if file_type.is_file() {
+                fs::copy(&source_path, &destination_path).unwrap();
+            }
+        }
+    }
+
     /// Check whether the state directory is empty.
     pub fn is_state_dir_empty(&self) -> bool {
         self.state_dir_entries().is_empty()
     }
 
-    /// Check wheter the state directory contains a long-term identity key.
-    pub fn state_dir_contains_id(&self) -> bool {
-        let expected_path = Path::new(&self.state_dir_path)
-            .join("keystore")
-            .join("hss")
-            .join("allium-cepa")
-            .join("ks_hs_id.ed25519_expanded_private");
-
-        self.state_dir_entries().iter().any(|e| {
-            if let Ok(entry) = e {
-                entry.path() == expected_path
-            } else {
-                false
+    /// Check whether the state directory contains only the provided entries.
+    pub fn state_dir_contains_only(&self, expected_entries: &[&str]) -> bool {
+        let state_dir_entries = self.state_dir_entries();
+        let entries: Vec<_> = state_dir_entries
+            .iter()
+            .map(|res| {
+                let entry = res.as_ref().unwrap();
+                entry.path().to_string_lossy().to_string()
+            })
+            .collect();
+        if entries.len() != expected_entries.len() {
+            return false;
+        }
+        for entry in expected_entries {
+            let path = format!(
+                "{}/{}",
+                self.state_dir_path.to_string_lossy().as_ref(),
+                entry
+            );
+            if !entries.contains(&path) {
+                return false;
             }
-        })
+        }
+        true
     }
 
     /// Returns a vector containing all entries in the state directory.
