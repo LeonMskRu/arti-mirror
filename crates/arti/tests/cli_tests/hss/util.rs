@@ -83,6 +83,9 @@ pub struct CTorMigrateCmd {
     state_dir: TempDir,
     /// The file path to the state directory.
     state_dir_path: PathBuf,
+    /// Nickname of the service to be migrated, defaults to `"allium-cepa"`.
+    #[getter(skip)]
+    nickname: String,
 }
 
 impl CTorMigrateCmd {
@@ -93,6 +96,7 @@ impl CTorMigrateCmd {
         Self {
             state_dir,
             state_dir_path,
+            nickname: "allium-cepa".to_string(),
         }
     }
 
@@ -108,7 +112,7 @@ impl CTorMigrateCmd {
             &opt,
             "hss",
             "-n",
-            "allium-cepa",
+            &self.nickname,
             "ctor-migrate",
             "-b",
         ]);
@@ -188,6 +192,11 @@ impl CTorMigrateCmd {
             .into_iter()
             .skip(1)
             .collect()
+    }
+
+    /// Setter for the field `nickname`
+    pub fn set_nickname(&mut self, nickname: String) {
+        self.nickname = nickname;
     }
 }
 

@@ -115,3 +115,14 @@ fn ctor_migrate_is_idempotent() {
     let error = String::from_utf8(cmd.output().unwrap().stderr).unwrap();
     assert!(error.contains("error: Service allium-cepa was already migrated."))
 }
+
+#[test]
+fn ctor_migrate_fails_if_applied_to_unregistered_service() {
+    let mut cmd = CTorMigrateCmd::new();
+    assert!(cmd.is_state_dir_empty());
+    cmd.set_nickname("unregistered".to_string());
+    let output = cmd.output().unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(cmd.output().unwrap().stderr).unwrap();
+    assert!(error.contains("error: The service identified using `--nickname unregistered` is not configured with any recognized CTor keystore."))
+}
