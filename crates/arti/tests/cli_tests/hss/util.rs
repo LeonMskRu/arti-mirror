@@ -86,6 +86,10 @@ pub struct CTorMigrateCmd {
     /// Nickname of the service to be migrated, defaults to `"allium-cepa"`.
     #[getter(skip)]
     nickname: String,
+    /// Configuration to the configuration file that will be used, defaults
+    /// to `CFG_CTOR_PATH`.
+    #[getter(skip)]
+    config: String,
 }
 
 impl CTorMigrateCmd {
@@ -97,6 +101,7 @@ impl CTorMigrateCmd {
             state_dir,
             state_dir_path,
             nickname: "allium-cepa".to_string(),
+            config: CFG_CTOR_PATH.to_string(),
         }
     }
 
@@ -107,7 +112,7 @@ impl CTorMigrateCmd {
         let opt = create_state_dir_entry(self.state_dir_path.to_string_lossy().as_ref());
         cmd.args([
             "-c",
-            CFG_CTOR_PATH,
+            &self.config,
             "-o",
             &opt,
             "hss",
@@ -197,6 +202,11 @@ impl CTorMigrateCmd {
     /// Setter for the field `nickname`
     pub fn set_nickname(&mut self, nickname: String) {
         self.nickname = nickname;
+    }
+
+    /// Setter for the field `config`
+    pub fn set_config(&mut self, config: String) {
+        self.config = config;
     }
 }
 

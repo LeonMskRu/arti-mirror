@@ -126,3 +126,14 @@ fn ctor_migrate_fails_if_applied_to_unregistered_service() {
     let error = String::from_utf8(cmd.output().unwrap().stderr).unwrap();
     assert!(error.contains("error: The service identified using `--nickname unregistered` is not configured with any recognized CTor keystore."))
 }
+
+#[test]
+fn ctor_migrate_fails_without_a_registered_ctor_keystore() {
+    let mut cmd = CTorMigrateCmd::new();
+    assert!(cmd.is_state_dir_empty());
+    cmd.set_config(CFG_PATH.to_string());
+    let output = cmd.output().unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(cmd.output().unwrap().stderr).unwrap();
+    assert!(error.contains("error: No CTor keystore are configured."))
+}
