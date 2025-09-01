@@ -137,3 +137,58 @@ fn ctor_migrate_fails_without_a_registered_ctor_keystore() {
     let error = String::from_utf8(cmd.output().unwrap().stderr).unwrap();
     assert!(error.contains("error: No CTor keystore are configured."))
 }
+
+#[test]
+fn ctor_migrate_aborts_correctly_without_batch() {
+    let mut migrate_cmd = CTorMigrateCmd::new();
+    assert!(migrate_cmd.is_state_dir_empty());
+
+    let onion_address_cmd = OnionAddressCmdBuilder::default()
+        .config_path(CFG_CTOR_PATH.to_string())
+        .state_directory(Some(
+            migrate_cmd.state_dir_path().to_string_lossy().to_string(),
+        ))
+        .build()
+        .unwrap();
+    let ctor_keystore_onion_address =
+        String::from_utf8(onion_address_cmd.output().unwrap().stdout).unwrap();
+
+    migrate_cmd.populate_state_dir();
+
+    let onion_address_cmd = OnionAddressCmdBuilder::default()
+        .config_path(CFG_PATH.to_string())
+        .state_directory(Some(
+            migrate_cmd.state_dir_path().to_string_lossy().to_string(),
+        ))
+        .build()
+        .unwrap();
+    let arti_keystore_onion_address =
+        String::from_utf8(onion_address_cmd.output().unwrap().stdout).unwrap();
+
+    assert_ne!(ctor_keystore_onion_address, arti_keystore_onion_address);
+
+    migrate_cmd.set_stdin("no".to_string());
+
+    assert!(migrate_cmd.state_dir_contains_only(ARTI_KEYSTORE_POPULATION));
+    let output = migrate_cmd.output().unwrap();
+    assert!(output.status.success());
+
+    // The migration didn't happen, old files haven't been removed.
+    assert!(migrate_cmd.state_dir_contains_only(ARTI_KEYSTORE_POPULATION));
+
+    let onion_address_cmd = OnionAddressCmdBuilder::default()
+        .config_path(CFG_PATH.to_string())
+        .state_directory(Some(
+            migrate_cmd.state_dir_path().to_string_lossy().to_string(),
+        ))
+        .build()
+        .unwrap();
+    let arti_keystore_onion_address =
+        String::from_utf8(onion_address_cmd.output().unwrap().stdout).unwrap();
+
+    // The identity keys in the Arti and CTor keystores differ, resulting in
+    // different onion addresses.
+    assert_ne!(ctor_keystore_onion_address, arti_keystore_onion_address);
+
+    assert!(String::from_utf8(output.stdout).unwrap().contains("Aborted."))
+}

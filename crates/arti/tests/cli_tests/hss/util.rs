@@ -90,6 +90,9 @@ pub struct CTorMigrateCmd {
     /// to `CFG_CTOR_PATH`.
     #[getter(skip)]
     config: String,
+    /// Input text passed to the command via STDIN. If `None`, no input is provided.
+    #[getter(skip)]
+    stdin: Option<String>,
 }
 
 impl CTorMigrateCmd {
@@ -102,6 +105,7 @@ impl CTorMigrateCmd {
             state_dir_path,
             nickname: "allium-cepa".to_string(),
             config: CFG_CTOR_PATH.to_string(),
+            stdin: None,
         }
     }
 
@@ -119,8 +123,13 @@ impl CTorMigrateCmd {
             "-n",
             &self.nickname,
             "ctor-migrate",
-            "-b",
         ]);
+
+        if let Some(content) = &self.stdin {
+            cmd.write_stdin(content.as_bytes());
+        } else {
+            cmd.arg("-b");
+        }
 
         cmd.output()
     }
@@ -207,6 +216,11 @@ impl CTorMigrateCmd {
     /// Setter for the field `config`
     pub fn set_config(&mut self, config: String) {
         self.config = config;
+    }
+
+    /// Setter for the field `stdin`
+    pub fn set_stdin(&mut self, content: String) {
+        self.stdin = Some(content);
     }
 }
 
