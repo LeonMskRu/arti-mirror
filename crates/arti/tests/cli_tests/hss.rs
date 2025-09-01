@@ -98,3 +98,20 @@ fn migrate_with_full_arti_keystore_succeede_with_batch_flag_activated() {
     // identity key, which exists in different formats across the two keystores.
     assert_eq!(ctor_keystore_onion_address, arti_keystore_onion_address)
 }
+
+#[test]
+fn ctor_migrate_is_idempotent() {
+    let cmd = CTorMigrateCmd::new();
+    assert!(cmd.is_state_dir_empty());
+    assert!(cmd.output().unwrap().status.success());
+    assert!(cmd.state_dir_contains_only(&[
+        EXPECTED_ID_KEY_PATH,
+        KEYSTORE_DIR_PATH,
+        HSS_DIR_PATH,
+        SERVICE_DIR_PATH
+    ]));
+    let output = cmd.output().unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(cmd.output().unwrap().stderr).unwrap();
+    assert!(error.contains("error: Service allium-cepa was already migrated."))
+}
