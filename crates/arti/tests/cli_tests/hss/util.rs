@@ -6,13 +6,18 @@ use std::{
 };
 
 use assert_cmd::Command;
+use std::io;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
 use crate::util::create_state_dir_entry;
 
-/// Path to a test specific configuration.
-const CFG_PATH: &str = "./tests/testcases/hss-extra/conf/hss.toml";
+/// Path to a test specific configuration that provides a full Arti native keystore.
+pub const CFG_PATH: &str = "./tests/testcases/hss-extra/conf/hss.toml";
+
+/// Path to a test specific configuration that provides a full Arti native keystore and a full CTor
+/// keystore.
+pub const CFG_CTOR_PATH: &str = "./tests/testcases/hss-extra/conf/hss-ctor.toml";
 
 /// Path to a fully populated Arti native keystore.
 const KEYSTORE_PATH: &str = "./tests/testcases/hss-extra/hss.in/local/state-dir";
@@ -67,13 +72,14 @@ pub const ARTI_KEYSTORE_POPULATION: &[&str] = &[
 ];
 
 /// A struct that represents the subcommand `hss ctor-migrate`.
-#[derive(Debug)]
+#[derive(Debug, amplify::Getters)]
 pub struct CTorMigrateCmd {
     /// The temporary directory representing the state directory.
     ///
     /// NOTE: Although this field is not used directly, it must be retained to prevent the
     /// temporary directory from being dropped prematurely.
     #[allow(dead_code)]
+    #[getter(skip)]
     state_dir: TempDir,
     /// The file path to the state directory.
     state_dir_path: PathBuf,
@@ -97,7 +103,7 @@ impl CTorMigrateCmd {
         let opt = create_state_dir_entry(self.state_dir_path.to_string_lossy().as_ref());
         cmd.args([
             "-c",
-            CFG_PATH,
+            CFG_CTOR_PATH,
             "-o",
             &opt,
             "hss",
@@ -130,7 +136,11 @@ impl CTorMigrateCmd {
             let file_name = source_path.file_name().unwrap();
             let destination_path = destination.join(file_name);
             if file_type.is_dir() {
-                fs::create_dir(&destination_path).unwrap();
+                if let Err(e) = fs::create_dir(&destination_path) {
+                    if e.kind() != io::ErrorKind::AlreadyExists {
+                        panic!("{}", e)
+                    }
+                };
                 Self::clone_dir(&source_path, &destination_path);
             } else if file_type.is_file() {
                 fs::copy(&source_path, &destination_path).unwrap();
@@ -178,5 +188,31 @@ impl CTorMigrateCmd {
             .into_iter()
             .skip(1)
             .collect()
+    }
+}
+
+/// A struct that represents the subcommand `hss onion-address`.
+#[derive(Debug, Clone, Default, Eq, PartialEq, derive_builder::Builder)]
+pub struct OnionAddressCmd {
+    /// Path to the configuration file supplied as the value of the `-c` flag.
+    config_path: String,
+    /// Optional path to a state directory.
+    /// If `Some`, passed as the value to the `-o` flag.
+    #[builder(default)]
+    state_directory: Option<String>,
+}
+
+impl OnionAddressCmd {
+    /// Execute the command and return its output as an [`Output`].
+    pub fn output(&self) -> std::io::Result<Output> {
+        let mut cmd = Command::cargo_bin("arti").unwrap();
+        cmd.args(["-c", &self.config_path]);
+        if let Some(state_directory) = &self.state_directory {
+            let opt = create_state_dir_entry(state_directory);
+            cmd.args(["-o", &opt]);
+        }
+        cmd.args(["hss", "-n", "allium-cepa", "onion-address"]);
+
+        cmd.output()
     }
 }
