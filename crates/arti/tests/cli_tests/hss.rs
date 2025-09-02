@@ -190,5 +190,9 @@ fn ctor_migrate_aborts_correctly_without_batch() {
     // different onion addresses.
     assert_ne!(ctor_keystore_onion_address, arti_keystore_onion_address);
 
-    assert!(String::from_utf8(output.stdout).unwrap().contains("Aborted."))
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Aborted.")
+    )
 }
