@@ -2,7 +2,11 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::task::{Context, Poll, Poll::*, ready};
+use std::task::{
+    Context,
+    Poll::{self, *},
+    Waker, ready,
+};
 
 use futures::{Sink, future};
 
@@ -32,6 +36,18 @@ use pin_project::pin_project;
 /// You can use [`Sink::poll_ready`] for this.
 /// Any [`Context`]-taking methods is suitable.
 ///
+/// ### Blocking
+///
+/// A `SometimesUnboundedSink` may be _blocked_.
+/// While it is blocked, it always returns Pending for bounded-send requests,
+/// even if the underlying sink can receive.
+/// (Unbounded-send requests are still allowed.)
+///
+/// Additionally, while the sink is blocked,
+/// only a limited number of cells will be flushed
+/// from the `SometimesUnboundSink`'s internal queue onto the underlying sink.
+/// This number can be adjusted with [`allow_flush`](Self::allow_flush).
+///
 /// ### Error handling
 ///
 /// Errors from the underlying sink may not be reported immediately,
@@ -43,6 +59,15 @@ use pin_project::pin_project;
 /// After an error has been reported, there may still be buffered data,
 /// which will only be delivered if `SometimesUnboundedSink` is polled again
 /// (and the error in the underlying sink was transient).
+//
+// TODO circpad: Depending on what we need to add in order to implement circuit padding,
+// we might need to allow `buf` to hold a certain capacity even in response
+// to regular bounded send.  (In other words, when the sink is full,
+// we'd let people queue up to N items on our buf with a regular poll_ready.)
+// If we do this, we'll also want `buf` to participate in our memquota logic.
+//
+// But we won't build that if we don't have to. This logic will need to be changed anyway
+// when we finally implement circuit muxes.
 #[pin_project]
 pub(crate) struct SometimesUnboundedSink<T, S> {
     /// Things we couldn't send_unbounded right away
@@ -55,7 +80,36 @@ pub(crate) struct SometimesUnboundedSink<T, S> {
     ///  * If this is nonempty, the executor knows to wake this task.
     ///    This is achieved as follows:
     ///    If this is nonempty, `inner.poll_ready()` has been called.
+    ///
+    ///    XXXX no longer true; what to say instead?
     buf: VecDeque<T>,
+
+    /// If true, we should behave as if the underlying sink is blocked,
+    /// _whether it is truly blocked or not_.
+    ///
+    /// That means that our own poll_ready() always returns Pending.
+    /// Additionally, our own attempts to flush onto the sink always
+    /// return Pending unless n_flush_bypass can be decremented.
+    ///
+    /// Invariants:
+    ///  * If this has been cleared, the executor knows to wake this task.
+    ///    We guarantee this by invoking `waker` whenever we clear it.
+    ///  * XXXX: what else?
+    blocked: bool,
+
+    /// A number of cells that we can flush in spite of `blocked`.
+    ///
+    /// Invariants:
+    ///  * This is 0 whenever blocked is false.
+    n_flush_bypass: usize,
+
+    /// A waker that we alert whenever our blocking status has become
+    /// more permissive.
+    ///
+    /// Invariants:
+    ///  * This is None whenever blocked is false.
+    ///  * This can only transition from Some to None by waking it.
+    waker: Option<Waker>,
 
     /// The actual sink
     ///
@@ -90,6 +144,9 @@ impl<T, S: Sink<T>> SometimesUnboundedSink<T, S> {
     pub(crate) fn new(inner: S) -> Self {
         SometimesUnboundedSink {
             buf: VecDeque::new(),
+            blocked: false,
+            n_flush_bypass: 0,
+            waker: None,
             inner,
         }
     }
@@ -146,6 +203,11 @@ impl<T, S: Sink<T>> SometimesUnboundedSink<T, S> {
     fn flush_buf(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
         let mut self_ = self.as_mut().project();
         while !self_.buf.is_empty() {
+            if *self_.blocked && *self_.n_flush_bypass == 0 {
+                // We don't want to flush, so we have to remember the waker.
+                *self_.waker = Some(cx.waker().clone());
+                return Pending;
+            }
             // Waker invariant:
             // if inner gave Pending, we give Pending too: ok
             // if inner gave Err, we're allowed to want polling again
@@ -153,9 +215,42 @@ impl<T, S: Sink<T>> SometimesUnboundedSink<T, S> {
             let item = self_.buf.pop_front().expect("suddenly empty!");
             // Waker invariant: returning Err
             self_.inner.as_mut().start_send(item)?;
+            *self_.n_flush_bypass = self_.n_flush_bypass.saturating_sub(1);
         }
         // Waker invariant: buffer is empty, and we're not about to return Pending
         Ready(Ok(()))
+    }
+
+    /// Mark this sink as blocked.
+    ///
+    /// While a sink is blocked,
+    /// it acts as if it were full in response to all non-unbounded send requests,
+    /// and it does not flush its internal queue
+    /// except as described with [`allow_flush`](Self::allow_flush).
+    #[allow(unused)] //XXXX
+    pub(crate) fn set_blocked(&mut self) {
+        self.blocked = true;
+    }
+
+    /// If this sink is blocked, allow `n` items to be flushed from the queue.
+    #[allow(unused)] //XXXX
+    pub(crate) fn allow_flush(&mut self, n: usize) {
+        if self.blocked {
+            self.n_flush_bypass = self.n_flush_bypass.saturating_add(n);
+            if let Some(waker) = self.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Mark this sink as unblocked.
+    #[allow(unused)] //XXXX
+    pub(crate) fn set_unblocked(&mut self) {
+        self.blocked = false;
+        self.n_flush_bypass = 0;
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 
     /// Obtain a reference to the inner `Sink`, `S`
