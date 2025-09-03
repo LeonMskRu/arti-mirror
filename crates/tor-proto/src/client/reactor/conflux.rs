@@ -958,6 +958,11 @@ impl ConfluxSet {
                                 reason: RemoveLegReason::ConfluxHandshakeTimeout,
                             }))
                         }
+                        // XXXX: poll leg.padding_events.next()
+                        // (we will need an accessor for a Circuit's PaddingEventStream)
+
+                        // XXXX: poll the padding timers on this leg using
+                        // leg.next_padding()  (or whatever we choose to call this API)
                         ret = send_fut => {
                             // Note: We don't actually use the returned SinkSendable,
                             // and continue writing to the SometimesUboundedSink in the reactor :(

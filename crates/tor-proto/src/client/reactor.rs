@@ -176,6 +176,11 @@ enum RunOnceCmdInner {
         /// A channel for sending completion notifications.
         done: Option<ReactorResultChannel<()>>,
     },
+
+    // XXX add a SendPadding variant. It will look very similar to `Send`,
+    // except it won't have the `done` channel, but will instead have some
+    // fields describing the padding cell (i.e. whether it can bypass blocks)
+
     /// Send a given control message on this circuit, and install a control-message handler to
     /// receive responses.
     #[cfg(feature = "send-control-msg")]
@@ -325,6 +330,9 @@ impl RunOnceCmdInner {
             }
             #[cfg(feature = "conflux")]
             CircuitCmd::Enqueue(msg) => Self::Enqueue { leg, msg },
+
+            // XXX handle padding variant
+
             CircuitCmd::CleanShutdown => Self::CleanShutdown,
         }
     }
@@ -700,6 +708,8 @@ impl Reactor {
         };
 
         let unique_id = TunnelScopedCircId::new(tunnel_id, unique_id);
+
+        // XXXX pass the padding_stream to Circuit
         let circuit_leg = Circuit::new(
             runtime.clone(),
             channel,
