@@ -64,6 +64,7 @@ use pin_project::pin_project;
 // we might need to allow `buf` to hold a certain capacity even in response
 // to regular bounded send.  (In other words, when the sink is full,
 // we'd let people queue up to N items on our buf with a regular poll_ready.)
+// If we do this, we'll also want `buf` to participate in our memquota logic.
 //
 // But we won't build that if we don't have to. This logic will need to be changed anyway
 // when we finally implement circuit muxes.
