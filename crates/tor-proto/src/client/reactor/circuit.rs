@@ -188,6 +188,9 @@ pub(super) enum CircuitCmd {
     /// the conflux handshake is complete.
     #[cfg(feature = "conflux")]
     ConfluxHandshakeComplete(SendRelayCell),
+
+    // XXX needs a new variant for padding
+
     /// Perform a clean shutdown on this circuit.
     CleanShutdown,
     /// Enqueue an out-of-order cell in the reactor.
