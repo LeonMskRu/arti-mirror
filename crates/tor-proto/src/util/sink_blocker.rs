@@ -144,6 +144,10 @@ impl<T, S: Sink<T>, P: Policy> Sink<T> for SinkBlocker<S, P> {
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let self_ = self.project();
+        // We always call poll_ready on the inner object,
+        // since that is necessary for some of our specialized Sink types
+        // (notably SometimesUnboundedSink) to make progress.
+        let inner_ready = self_.inner.poll_ready(cx);
         if self_.policy.is_blocking() {
             // We're blocked.  We're going to store the context's Waker,
             // so that we can invoke it later when the policy changes.
@@ -153,7 +157,7 @@ impl<T, S: Sink<T>, P: Policy> Sink<T> for SinkBlocker<S, P> {
             // If this returns Ready, great!
             // If this returns Pending, it will wake up the context when it is
             // no longer blocked.
-            self_.inner.poll_ready(cx)
+            inner_ready
         }
     }
 
