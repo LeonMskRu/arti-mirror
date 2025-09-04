@@ -11,21 +11,15 @@ use {
 
 use anyhow::anyhow;
 use arti_client::{InertTorClient, TorClientConfig};
-use clap::{ArgMatches, Args, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, FromArgMatches, Subcommand, ValueEnum};
 use safelog::DisplayRedacted;
 use tor_hsservice::{HsId, HsNickname, OnionService};
 use tor_rtcompat::Runtime;
 
 use crate::{ArtiConfig, Result, TorClient};
 
-/// The hss subcommands the arti CLI will be augmented with.
-#[derive(Parser, Debug)]
-pub(crate) enum HssSubcommands {
-    /// Run state management commands for an Arti hidden service.
-    Hss(Hss),
-}
-
-#[derive(Debug, Parser)]
+/// Run state management commands for an Arti hidden service.
+#[derive(Debug, Args)]
 pub(crate) struct Hss {
     /// Arguments shared by all hss subcommands.
     #[command(flatten)]

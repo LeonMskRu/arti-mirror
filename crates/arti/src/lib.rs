@@ -114,16 +114,9 @@ use tor_config::mistrust::BuilderExt as _;
 use tor_rtcompat::ToplevelRuntime;
 
 use anyhow::{Context, Error, Result};
-use clap::{Arg, ArgAction, Command, value_parser};
+use clap::{Arg, ArgAction, Command, Subcommand, value_parser};
 #[allow(unused_imports)]
 use tracing::{error, info, warn};
-
-#[cfg(any(
-    feature = "hsc",
-    feature = "onion-service-service",
-    feature = "onion-service-cli-extra",
-))]
-use clap::Subcommand as _;
 
 #[cfg(feature = "experimental-api")]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-api")))]
@@ -266,50 +259,46 @@ where
                     .action(ArgAction::SetTrue)
                     .help("Don't check permissions on the files we use."),
             )
-            .subcommand(
-                Command::new("proxy")
-                    .about(
-                        "Run Arti in SOCKS proxy mode, proxying connections through the Tor network.",
-                    )
-                    .arg(
-                        Arg::new("socks-port")
-                            .short('p')
-                            .action(ArgAction::Set)
-                            .value_name("PORT")
-                            .help("Port to listen on for SOCKS connections (overrides the port in the config if specified).")
-                    )
-                    .arg(
-                        Arg::new("dns-port")
-                            .short('d')
-                            .action(ArgAction::Set)
-                            .value_name("PORT")
-                            .help("Port to listen on for DNS request (overrides the port in the config if specified).")
-                    )
-            )
             .subcommand_required(true)
             .arg_required_else_help(true);
 
     // When adding a subcommand, it may be necessary to add an entry in
     // `maint/check-cli-help`, to the function `help_arg`.
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "onion-service-service")] {
-            let clap_app = subcommands::hss::HssSubcommands::augment_subcommands(clap_app);
-        }
+    #[derive(Subcommand)]
+    enum SubCommands {
+        /// Run Arti in SOCKS proxy mode, proxying connections through the Tor network.
+        Proxy {
+            /// Port to listen on for SOCKS connections (overrides the port in the config).
+            #[arg(short = 'p', value_name = "PORT")]
+            socks_port: Option<u16>,
+
+            /// Port to listen on for DNS requests (overrides the port in the config).
+            #[arg(short = 'd', value_name = "PORT")]
+            dns_port: Option<u16>,
+        },
+
+        /// Run state management commands for an Arti hidden service client.
+        #[cfg(feature = "hsc")]
+        #[command(subcommand)]
+        Hsc(subcommands::hsc::HscSubcommand),
+
+        /// Run state management commands for an Arti hidden service.
+        #[cfg(feature = "onion-service-service")]
+        Hss(subcommands::hss::Hss),
+
+        /// Run keystore management commands.
+        #[cfg(feature = "onion-service-cli-extra")]
+        #[command(subcommand)]
+        Keys(subcommands::keys::KeysSubcommand),
+
+        /// Run plumbing key management commands.
+        #[cfg(feature = "onion-service-cli-extra")]
+        #[command(name = "keys-raw", subcommand)]
+        Raw(subcommands::raw::RawSubcommand),
     }
 
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "hsc")] {
-            let clap_app = subcommands::hsc::HscSubcommands::augment_subcommands(clap_app);
-        }
-    }
-
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "onion-service-cli-extra")] {
-            let clap_app = subcommands::keys::KeysSubcommands::augment_subcommands(clap_app);
-            let clap_app = subcommands::raw::RawSubcommands::augment_subcommands(clap_app);
-        }
-    }
+    let clap_app = SubCommands::augment_subcommands(clap_app);
 
     // Tracing doesn't log anything when there is no subscriber set.  But we want to see
     // logging messages from config parsing etc.  We can't set the global default subscriber
@@ -461,18 +450,15 @@ where
 /// function. Please reach out to the Arti developers, so we can work together
 /// to get you the stable API you need.
 pub fn main() {
-    match main_main(std::env::args_os()) {
-        Ok(()) => {}
-        Err(e) => {
-            use arti_client::HintableError;
-            if let Some(hint) = e.hint() {
-                info!("{}", hint);
-            }
+    if let Err(e) = main_main(std::env::args_os()) {
+        use arti_client::HintableError;
+        if let Some(hint) = e.hint() {
+            info!("{}", hint);
+        }
 
-            match e.downcast_ref::<clap::Error>() {
-                Some(clap_err) => clap_err.exit(),
-                None => with_safe_logging_suppressed(|| tor_error::report_and_exit(e)),
-            }
+        match e.downcast_ref::<clap::Error>() {
+            Some(clap_err) => clap_err.exit(),
+            None => with_safe_logging_suppressed(|| tor_error::report_and_exit(e)),
         }
     }
 }

@@ -5,7 +5,7 @@ use crate::{Result, TorClient};
 
 use anyhow::{Context, anyhow};
 use arti_client::{HsClientDescEncKey, HsId, InertTorClient, KeystoreSelector, TorClientConfig};
-use clap::{ArgMatches, Args, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, FromArgMatches, Subcommand, ValueEnum};
 use safelog::DisplayRedacted;
 use tor_rtcompat::Runtime;
 
@@ -13,14 +13,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::str::FromStr;
 
-/// The hsc subcommands the arti CLI will be augmented with.
-#[derive(Parser, Debug)]
-pub(crate) enum HscSubcommands {
-    /// Run state management commands for an Arti hidden service client.
-    #[command(subcommand)]
-    Hsc(HscSubcommand),
-}
-
+/// Run state management commands for an Arti hidden service client.
 #[derive(Debug, Subcommand)]
 pub(crate) enum HscSubcommand {
     /// Prepare a service discovery key for connecting
