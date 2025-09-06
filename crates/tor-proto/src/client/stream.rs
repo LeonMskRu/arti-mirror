@@ -34,7 +34,9 @@ pub use incoming::{
     IncomingStreamRequestDisposition, IncomingStreamRequestFilter,
 };
 pub use params::StreamParameters;
-pub use raw::StreamReceiver;
+// TODO: We may want to make this public in the future, but are waiting
+// for a use case.
+pub(crate) use raw::StreamReceiver;
 pub use resolve::ResolveStream;
 pub(crate) use {data::DataCmdChecker, resolve::ResolveCmdChecker};
 
