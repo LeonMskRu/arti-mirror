@@ -4,11 +4,79 @@ use hyper::body::Bytes;
 use hyper::http::uri::Scheme;
 use hyper::{Request, Uri};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use arti_client::{TorClient, TorClientConfig};
 
 const TEST_URL: &str = "https://check.torproject.org/api/ip";
+
+/// Small custom transport which:
+/// - Immediately calls poll_flush() after a successful write.
+/// - Calls poll_flush() to push pending outbound bytes before reading.
+/// Note that this is in contrast with the default Arti behavior which does internal buffering.
+struct CustomAutoFlush<S>(S);
+
+impl<S> CustomAutoFlush<S> {
+    fn new(inner: S) -> Self {
+        Self(inner)
+    }
+}
+
+impl<S> AsyncRead for CustomAutoFlush<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Flush any pending data before reading.
+        match Pin::new(&mut self.0).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for CustomAutoFlush<S>
+where
+    S: AsyncWrite + AsyncRead + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.0).poll_write(cx, data) {
+            Poll::Ready(Ok(n)) if n > 0 => {
+                // Don't keep written data in buffer but flush immediately to avoid stalling TLS handshake.
+                // (this causes the issues with `native-tls` on MacOS using Apple's Secure Transport).
+                match Pin::new(&mut self.0).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +111,8 @@ async fn main() -> Result<()> {
     };
 
     let stream = tor_client.connect((host, port)).await?;
+    // Make stream use our own custom transport for immediate flushing.
+    let stream = CustomAutoFlush::new(stream);
 
     // Following part is just standard usage of Hyper.
     eprintln!("[+] Making request to: {}", url);
