@@ -4,7 +4,49 @@
 //! of a temporary directory. Due to this and other considerations, the `assert_cmd` crate is used to
 //! test these subcommands instead of the preferred `trycmd` crate (see [README](../README.md)).
 //!
-//! Test data for this suite is stored in the `hss-extra` directory.
+//! ## Note on the test data
+//!
+//! Test data for this suite is stored in the `hss-extra/hss.in/local` directory. The structure is as follows:
+//!
+//! ```
+//! local
+//! ├── ctor-keystore
+//! │   ├── hostname
+//! │   ├── hs_ed25519_public_key
+//! │   └── hs_ed25519_secret_key
+//! └── state-dir
+//!     └── keystore
+//!         ├── hss
+//!         │   └── allium-cepa
+//!         │       ├── ipts
+//!         │       │   ├── k_hss_ntor+2a6054c3432b880b76cf379f66daf1a34c88693efed5e85bd90507a1fea231d7.x25519_private
+//!         │       │   ├── k_hss_ntor+84a3a863484ff521081ee8e6e48a6129d0c83bef89fe294a5dda6f782b43dec8.x25519_private
+//!         │       │   ├── k_hss_ntor+ce8514e2fe016e4705b064f2226a7628f4226e9a15d28607112e4eac3b3a012f.x25519_private
+//!         │       │   ├── k_sid+2a6054c3432b880b76cf379f66daf1a34c88693efed5e85bd90507a1fea231d7.ed25519_private
+//!         │       │   ├── k_sid+84a3a863484ff521081ee8e6e48a6129d0c83bef89fe294a5dda6f782b43dec8.ed25519_private
+//!         │       │   └── k_sid+ce8514e2fe016e4705b064f2226a7628f4226e9a15d28607112e4eac3b3a012f.ed25519_private
+//!         │       ├── ks_hs_blind_id+20326_1440_43200.ed25519_expanded_private
+//!         │       ├── ks_hs_blind_id+20327_1440_43200.ed25519_expanded_private
+//!         │       ├── ks_hs_id.ed25519_expanded_private
+//!         │       └── unrecognized-entry
+//!         ├── unrecognized-path
+//!         └── unrecognized-path-dir
+//!             └── unrecognized-path
+//! ```
+//!
+//! Where:
+//!
+//! - `local/ctor-keystore` is a fully populated CTor keystore.
+//! - `local/state-dir` is an example Arti state directory, partially populated.
+//!   This directory typically corresponds to `~/.local/share/arti`. For the
+//!   purposes of testing, it contains only `local/state-dir/keystore`.
+//! - `local/state-dir/hss/allium-cepa` is a partially populated keystore for the hidden service
+//!   `allium-cepa`. It includes a long-term identity key and several derived keys.
+//!   For testing purposes, all derived keys may be empty files. Their presence ensures
+//!   they are correctly removed during migration.
+//! - `unrecognized-path` and `unrecognized-entry` are included to verify that
+//!   the migration process does not remove them. Form more information about unrecognized entries
+//!   and paths see [keys list documention](../../../../doc/keys.md)
 
 use crate::hss::util::{
     ARTI_KEYSTORE_POPULATION, CFG_CTOR_PATH, CFG_PATH, CTorMigrateCmd, EXPECTED_ID_KEY_PATH,
