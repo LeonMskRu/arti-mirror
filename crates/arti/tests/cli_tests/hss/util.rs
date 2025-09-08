@@ -35,20 +35,19 @@ pub const HSS_DIR_PATH: &str = "keystore/hss";
 pub const SERVICE_DIR_PATH: &str = "keystore/hss/allium-cepa";
 
 /// Path to an unrecognized keystore entry, relative to the state directory.
-pub const EXPECTED_UNRECOGNIZED_KEYSTORE_ENTRY: &str = "keystore/hss/allium-cepa/herba-spontanea";
+pub const EXPECTED_UNRECOGNIZED_KEYSTORE_ENTRY: &str = "keystore/hss/allium-cepa/unrecognized-entry";
 
 /// Path to ipts directory, relative to the state directory.
 pub const IPTS_DIR_PATH: &str = "keystore/hss/allium-cepa/ipts";
 
 /// A part of an unrecognized path, relative to the state directory.
-pub const UNRECOGNIZED_DIR_PATH: &str = "keystore/opus-abusivum";
+pub const UNRECOGNIZED_PATH_1: &str = "keystore/unrecognized-path";
 
 /// A part of an unrecognized path, relative to the state directory.
-pub const UNRECOGNIZED_SERVICE_PATH: &str = "keystore/opus-abusivum/herba-spontanea";
+pub const UNRECOGNIZED_PATH_2_DIR: &str = "keystore/unrecognized-path-dir";
 
 /// Unrecognized path, relative to the state directory.
-pub const UNRECOGNIZED_SERVICE_ID_PATH: &str =
-    "keystore/opus-abusivum/herba-spontanea/ks_hs_id.ed25519_expanded_private";
+pub const UNRECOGNIZED_PATH_2: &str = "keystore/unrecognized-path-dir/unrecognized-path";
 
 /// A collection of every path present in the default state directory.
 pub const ARTI_KEYSTORE_POPULATION: &[&str] = &[
@@ -66,9 +65,9 @@ pub const ARTI_KEYSTORE_POPULATION: &[&str] = &[
     "keystore/hss/allium-cepa/ipts/k_hss_ntor+ce8514e2fe016e4705b064f2226a7628f4226e9a15d28607112e4eac3b3a012f.x25519_private",
     "keystore/hss/allium-cepa/ipts/k_hss_ntor+84a3a863484ff521081ee8e6e48a6129d0c83bef89fe294a5dda6f782b43dec8.x25519_private",
     "keystore/hss/allium-cepa/ipts/k_hss_ntor+2a6054c3432b880b76cf379f66daf1a34c88693efed5e85bd90507a1fea231d7.x25519_private",
-    UNRECOGNIZED_DIR_PATH,
-    UNRECOGNIZED_SERVICE_PATH,
-    UNRECOGNIZED_SERVICE_ID_PATH,
+    UNRECOGNIZED_PATH_1,
+    UNRECOGNIZED_PATH_2_DIR,
+    UNRECOGNIZED_PATH_2,
 ];
 
 /// A struct that represents the subcommand `hss ctor-migrate`.

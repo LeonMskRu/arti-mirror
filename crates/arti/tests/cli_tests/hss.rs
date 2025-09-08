@@ -9,8 +9,8 @@
 use crate::hss::util::{
     ARTI_KEYSTORE_POPULATION, CFG_CTOR_PATH, CFG_PATH, CTorMigrateCmd, EXPECTED_ID_KEY_PATH,
     EXPECTED_UNRECOGNIZED_KEYSTORE_ENTRY, HSS_DIR_PATH, IPTS_DIR_PATH, KEYSTORE_DIR_PATH,
-    OnionAddressCmdBuilder, SERVICE_DIR_PATH, UNRECOGNIZED_DIR_PATH, UNRECOGNIZED_SERVICE_ID_PATH,
-    UNRECOGNIZED_SERVICE_PATH,
+    OnionAddressCmdBuilder, SERVICE_DIR_PATH, UNRECOGNIZED_PATH_1, UNRECOGNIZED_PATH_2,
+    UNRECOGNIZED_PATH_2_DIR,
 };
 
 mod util;
@@ -75,9 +75,9 @@ fn migration_succeeds_with_full_arti_keystore_and_batch_enabled() {
         SERVICE_DIR_PATH,
         EXPECTED_UNRECOGNIZED_KEYSTORE_ENTRY,
         IPTS_DIR_PATH,
-        UNRECOGNIZED_DIR_PATH,
-        UNRECOGNIZED_SERVICE_PATH,
-        UNRECOGNIZED_SERVICE_ID_PATH
+        UNRECOGNIZED_PATH_1,
+        UNRECOGNIZED_PATH_2_DIR,
+        UNRECOGNIZED_PATH_2
     ]));
 
     // The migration has completed: the CTor identity key has been converted into an
