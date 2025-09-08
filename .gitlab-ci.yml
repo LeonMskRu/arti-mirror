@@ -686,8 +686,16 @@ every-crate:
   image: $RECENT_RUST_IMAGE
   needs: ["rust-checks", "rust-recent-async-std-rustls"]
   script:
-    - maint/common/apt-install python3-toml
-    - ./maint/every-crate
+    - maint/common/apt-install python3-toml parallel
+    - ./maint/every-crate -c $PARALLEL_N -n 5
+  parallel:
+    matrix:
+      - PARALLEL_N:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
 
 matrix-check:
   stage: test
