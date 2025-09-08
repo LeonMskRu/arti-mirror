@@ -35,7 +35,8 @@ pub const HSS_DIR_PATH: &str = "keystore/hss";
 pub const SERVICE_DIR_PATH: &str = "keystore/hss/allium-cepa";
 
 /// Path to an unrecognized keystore entry, relative to the state directory.
-pub const EXPECTED_UNRECOGNIZED_KEYSTORE_ENTRY: &str = "keystore/hss/allium-cepa/unrecognized-entry";
+pub const EXPECTED_UNRECOGNIZED_KEYSTORE_ENTRY: &str =
+    "keystore/hss/allium-cepa/unrecognized-entry";
 
 /// Path to ipts directory, relative to the state directory.
 pub const IPTS_DIR_PATH: &str = "keystore/hss/allium-cepa/ipts";
