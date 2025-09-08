@@ -204,6 +204,7 @@ impl CTorMigrateCmd {
     fn state_dir_entries(&self) -> Vec<Result<walkdir::DirEntry, walkdir::Error>> {
         WalkDir::new(&self.state_dir_path)
             .into_iter()
+            // Skip `&self.state_dir_path`.
             .skip(1)
             .collect()
     }
