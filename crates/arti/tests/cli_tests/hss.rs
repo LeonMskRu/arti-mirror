@@ -16,7 +16,7 @@ use crate::hss::util::{
 mod util;
 
 #[test]
-fn migrate_with_empty_arti_keystore_succeede() {
+fn migration_succeeds_with_empty_arti_keystore() {
     let cmd = CTorMigrateCmd::new();
     assert!(cmd.is_state_dir_empty());
     assert!(cmd.output().unwrap().status.success());
@@ -29,7 +29,7 @@ fn migrate_with_empty_arti_keystore_succeede() {
 }
 
 #[test]
-fn migrate_with_full_arti_keystore_succeede_with_batch_flag_activated() {
+fn migration_succeeds_with_full_arti_keystore_and_batch_enabled() {
     let migrate_cmd = CTorMigrateCmd::new();
     assert!(migrate_cmd.is_state_dir_empty());
 
@@ -117,7 +117,7 @@ fn ctor_migrate_is_idempotent() {
 }
 
 #[test]
-fn ctor_migrate_fails_if_applied_to_unregistered_service() {
+fn ctor_migrate_fails_when_applied_to_unregistered_service() {
     let mut cmd = CTorMigrateCmd::new();
     assert!(cmd.is_state_dir_empty());
     cmd.set_nickname("unregistered".to_string());
@@ -128,7 +128,7 @@ fn ctor_migrate_fails_if_applied_to_unregistered_service() {
 }
 
 #[test]
-fn ctor_migrate_fails_without_a_registered_ctor_keystore() {
+fn ctor_migrate_fails_without_registered_ctor_keystore() {
     let mut cmd = CTorMigrateCmd::new();
     assert!(cmd.is_state_dir_empty());
     cmd.set_config(CFG_PATH.to_string());
@@ -139,7 +139,7 @@ fn ctor_migrate_fails_without_a_registered_ctor_keystore() {
 }
 
 #[test]
-fn ctor_migrate_aborts_correctly_without_batch() {
+fn ctor_migrate_aborts_correctly_without_batch_flag() {
     let mut migrate_cmd = CTorMigrateCmd::new();
     assert!(migrate_cmd.is_state_dir_empty());
 
