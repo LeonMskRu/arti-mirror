@@ -115,12 +115,12 @@ impl CTorMigrateCmd {
 
         let opt = create_state_dir_entry(self.state_dir_path.to_string_lossy().as_ref());
         cmd.args([
-            "-c",
+            "--config",
             &self.config,
             "-o",
             &opt,
             "hss",
-            "-n",
+            "--nickname",
             &self.nickname,
             "ctor-migrate",
         ]);
@@ -128,7 +128,7 @@ impl CTorMigrateCmd {
         if let Some(content) = &self.stdin {
             cmd.write_stdin(content.as_bytes());
         } else {
-            cmd.arg("-b");
+            cmd.arg("--batch");
         }
 
         cmd.output()
@@ -239,12 +239,12 @@ impl OnionAddressCmd {
     /// Execute the command and return its output as an [`Output`].
     pub fn output(&self) -> std::io::Result<Output> {
         let mut cmd = Command::cargo_bin("arti").unwrap();
-        cmd.args(["-c", &self.config_path]);
+        cmd.args(["--config", &self.config_path]);
         if let Some(state_directory) = &self.state_directory {
             let opt = create_state_dir_entry(state_directory);
             cmd.args(["-o", &opt]);
         }
-        cmd.args(["hss", "-n", "allium-cepa", "onion-address"]);
+        cmd.args(["hss", "--nickname", "allium-cepa", "onion-address"]);
 
         cmd.output()
     }
