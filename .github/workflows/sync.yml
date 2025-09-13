@@ -1,0 +1,53 @@
+name: Sync Arti from upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Backup workflow file
+        run: |
+          mkdir -p /tmp/backup
+          cp .github/workflows/sync.yml /tmp/backup/  # Сохраняем workflow файл
+
+      - name: Setup Git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream & fetch
+        run: |
+          git remote add upstream https://gitlab.torproject.org/tpo/core/arti.git || true
+          git fetch upstream --tags --prune --progress
+
+      - name: Sync main branch
+        run: |
+          git checkout main || git checkout -b main
+          git reset --hard upstream/main
+
+      - name: Restore workflow file
+        run: |
+          mkdir -p .github/workflows
+          cp /tmp/backup/sync.yml .github/workflows/  # Восстанавливаем workflow
+          git add .github/workflows/sync.yml
+          git commit -m "Restore sync workflow" || echo "No changes to commit"
+
+      - name: Push to mirror
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git remote set-url origin https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git
+          git push origin main --force
+          git push origin --tags --force
