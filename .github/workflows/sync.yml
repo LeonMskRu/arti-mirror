@@ -1,0 +1,86 @@
+name: Sync Arti from upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mirror repo (full history)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Backup workflow file
+        run: |
+          mkdir -p /tmp/backup
+          cp .github/workflows/sync.yml /tmp/backup/sync.yml
+
+      - name: Setup Git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://gitlab.torproject.org/tpo/core/arti.git || true
+
+      - name: Fetch upstream (branches + tags, prune stale)
+        run: |
+          git fetch upstream \
+            --tags \
+            --prune \
+            --prune-tags \
+            --progress \
+            || { echo "❌ FETCH FROM UPSTREAM FAILED — aborting to protect mirror"; exit 1; }
+
+      - name: Show last 10 tags (debug)
+        run: |
+          echo "=== Последние теги из upstream ==="
+          git tag -l | sort -V | tail -n 10
+
+      - name: Verify upstream has content (safeguard)
+        run: |
+          TAG_COUNT=$(git tag -l | wc -l)
+          if [ "$TAG_COUNT" -lt 5 ]; then
+            echo "❌ Too few tags ($TAG_COUNT) — upstream fetch may be incomplete. Aborting."
+            exit 1
+          fi
+          echo "✅ Tag count OK: $TAG_COUNT"
+
+      - name: Set origin remote URL with token
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git remote set-url origin \
+            https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git
+
+      - name: Prepare local main = upstream/main + workflow file
+        run: |
+          # Переключаем локальный main на upstream/main
+          git checkout -B main refs/remotes/upstream/main
+
+          # Добавляем workflow поверх upstream-коммита
+          mkdir -p .github/workflows
+          cp /tmp/backup/sync.yml .github/workflows/sync.yml
+          git add .github/workflows/sync.yml
+
+          if git diff --cached --quiet; then
+            echo "✅ Workflow already exists in upstream — no extra commit needed"
+          else
+            git commit -m "ci: restore sync workflow [skip ci]"
+            echo "✅ Workflow commit added on top of upstream/main"
+          fi
+
+      - name: Push mirror (local main with workflow + all upstream refs + tags)
+        run: |
+          # --mirror пушит refs/heads/main (= upstream + workflow) на GitHub
+          # refs/remotes/upstream/* уйдут как refs/remotes/upstream/* (не затрагивают main)
+          git push --mirror --force origin
